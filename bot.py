@@ -137,42 +137,124 @@ class HunyuanBrowser:
         # Give SPA transitions time to render.
         await self.page.wait_for_timeout(1800)
 
+    async def _attached_image_count(self) -> int:
+        """Return how many local files are currently attached to file inputs."""
+        assert self.page
+        total = 0
+        inputs = self.page.locator('input[type="file"]')
+        for i in range(await inputs.count()):
+            try:
+                n = await inputs.nth(i).evaluate("el => el.files ? el.files.length : 0")
+                total += int(n or 0)
+            except Exception:
+                pass
+        return total
+
     async def upload_image(self, image_path: Path):
         assert self.page
         await self.prepare_image_to_3d()
-        inputs = self.page.locator('input[type="file"]')
-        count = await inputs.count()
-        if count == 0:
-            raise RuntimeError("لم أجد مربع رفع الصورة في الصفحة.")
 
-        # Prefer an image-accepting input, otherwise use the first file input.
-        chosen = None
-        for i in range(count):
-            el = inputs.nth(i)
+        # Current Hunyuan UI exposes a visible Chinese "上传图片" control.
+        # Prefer the real file-chooser event so we do not accidentally fill an
+        # unrelated hidden input elsewhere in the SPA.
+        upload_pattern = re.compile(r"上传图片|Upload\s*Image|Choose\s*Image|Select\s*Image", re.I)
+        upload_targets = [
+            self.page.get_by_role("button", name=upload_pattern),
+            self.page.get_by_text(upload_pattern),
+        ]
+        chooser_used = False
+        for loc in upload_targets:
             try:
-                accept = (await el.get_attribute("accept")) or ""
-                if "image" in accept.lower() or accept == "":
-                    chosen = el
-                    break
+                target = loc.first
+                if await target.count() and await target.is_visible(timeout=500):
+                    try:
+                        async with self.page.expect_file_chooser(timeout=5000) as info:
+                            await target.click(timeout=5000)
+                        chooser = await info.value
+                        await chooser.set_files(str(image_path))
+                        chooser_used = True
+                        break
+                    except Exception:
+                        # Some builds wrap the label around a hidden file input;
+                        # fall through to the direct-input fallback below.
+                        pass
             except Exception:
-                pass
-        chosen = chosen or inputs.first
-        await chosen.set_input_files(str(image_path))
-        await self.page.wait_for_timeout(2500)
+                continue
+
+        if not chooser_used:
+            inputs = self.page.locator('input[type="file"]')
+            count = await inputs.count()
+            if count == 0:
+                raise RuntimeError("لم أجد مربع رفع الصورة في صفحة Hunyuan الحالية.")
+
+            candidates = []
+            for i in range(count):
+                el = inputs.nth(i)
+                try:
+                    accept = ((await el.get_attribute("accept")) or "").lower()
+                    # Put image-specific inputs first. Keep empty accept as fallback.
+                    score = 0 if "image" in accept else (1 if accept == "" else 2)
+                    candidates.append((score, i, el))
+                except Exception:
+                    candidates.append((3, i, el))
+            candidates.sort(key=lambda x: (x[0], x[1]))
+
+            attached = False
+            for _, _, el in candidates:
+                try:
+                    await el.set_input_files(str(image_path))
+                    await self.page.wait_for_timeout(700)
+                    n = await el.evaluate("node => node.files ? node.files.length : 0")
+                    if int(n or 0) > 0:
+                        attached = True
+                        break
+                except Exception:
+                    continue
+            if not attached:
+                raise RuntimeError("وجدت حقل الرفع لكن Hunyuan لم يقبل الصورة داخله.")
+
+        # Do not pretend generation started unless the browser really has a file.
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if await self._attached_image_count() > 0:
+                await self.page.wait_for_timeout(1800)
+                return
+            await self.page.wait_for_timeout(400)
+        raise RuntimeError("تم اختيار الصورة لكن واجهة Hunyuan لم تثبت تحميلها؛ أوقفت الطلب قبل صرف أي نقطة.")
 
     async def click_generate(self) -> bool:
-        patterns = [
-            r"Generate\s*Immediately",
-            r"Generate",
-            r"Create\s*3D",
-            r"生成\s*3D",
-            r"立即生成",
-            r"开始生成",
-            r"生成",
-        ]
-        for p in patterns:
-            if await self._click_text(p, timeout=5000):
+        assert self.page
+        pattern = re.compile(
+            r"Generate\s*Immediately|Generate|Create\s*3D|生成\s*3D|立即生成|开始生成|生成",
+            re.I,
+        )
+        # Prefer actual buttons and only click an enabled visible control.
+        buttons = self.page.get_by_role("button", name=pattern)
+        for i in range(await buttons.count()):
+            btn = buttons.nth(i)
+            try:
+                if await btn.is_visible(timeout=300) and await btn.is_enabled(timeout=300):
+                    await btn.click(timeout=5000)
+                    await self.page.wait_for_timeout(1200)
+                    return True
+            except Exception:
+                continue
+
+        # Fallback for non-semantic clickable elements.
+        texts = self.page.get_by_text(pattern)
+        for i in range(min(await texts.count(), 8)):
+            el = texts.nth(i)
+            try:
+                if not await el.is_visible(timeout=300):
+                    continue
+                disabled = await el.get_attribute("aria-disabled")
+                if disabled == "true":
+                    continue
+                await el.click(timeout=5000)
+                await self.page.wait_for_timeout(1200)
                 return True
+            except Exception:
+                continue
         return False
 
     async def _download_button_visible(self) -> bool:
@@ -295,18 +377,16 @@ class HunyuanBrowser:
             await self.upload_image(image_path)
             clicked = await self.click_generate()
             if not clicked:
-                # Some versions auto-start once an image is uploaded. Wait briefly before declaring failure.
-                await self.page.wait_for_timeout(2500)
-                if not await self._download_button_visible():
-                    body = ""
-                    try:
-                        body = await self.page.locator("body").inner_text(timeout=3000)
-                    except Exception:
-                        pass
-                    if re.search(r"Login|Log in|Sign in|登录|登入", body, re.I) and any(
-                        x in self.page.url.lower() for x in ("login", "signin", "auth")
-                    ):
-                        raise RuntimeError("تحتاج تسجّل دخول من واجهة المتصفح أولاً.")
+                body = ""
+                try:
+                    body = await self.page.locator("body").inner_text(timeout=3000)
+                except Exception:
+                    pass
+                if re.search(r"Login|Log in|Sign in|登录|登入", body, re.I) and any(
+                    x in self.page.url.lower() for x in ("login", "signin", "auth")
+                ):
+                    raise RuntimeError("تحتاج تسجّل دخول من واجهة المتصفح أولاً.")
+                raise RuntimeError("تم رفع الصورة لكن لم أجد زر التوليد المفعّل؛ أوقفت الطلب قبل الانتظار الوهمي.")
             await self.wait_until_ready(progress_cb=progress_cb)
             return await self.download_result()
 
@@ -334,6 +414,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     browser = await get_browser(context)
+    if browser.lock.locked():
+        await update.effective_message.reply_text(
+            "🟠 يوجد توليد قيد التنفيذ. استخدم /shot أو /status، ولا أفتح صفحة جديدة حتى لا يتعطل الطلب الحالي."
+        )
+        return
     try:
         await browser.open_home()
     except Exception:
@@ -349,6 +434,11 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     browser = await get_browser(context)
+    if browser.lock.locked():
+        await update.effective_message.reply_text(
+            "🟠 يوجد توليد قيد التنفيذ. استخدم /shot أو /status؛ لن أغيّر الصفحة أثناء التوليد."
+        )
+        return
     try:
         await browser.open_home()
         await update.effective_message.reply_text("✅ فتحت صفحة Hunyuan داخل المتصفح.")
@@ -399,13 +489,20 @@ async def _download_telegram_image(update: Update, context: ContextTypes.DEFAULT
 @owner_only
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    browser = await get_browser(context)
+    if browser.lock.locked():
+        await msg.reply_text(
+            "🟠 عندي توليد شغّال حالياً. ما راح أضيف صورة ثانية حتى لا تتداخل الطلبات أو ينصرف رصيد إضافي.\n"
+            "استخدم /status أو /shot لمتابعة الطلب الحالي."
+        )
+        return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     image_path = await _download_telegram_image(update, context)
     if not image_path:
         await msg.reply_text("أرسل الصورة كصورة أو كملف صورة.")
         return
 
-    browser = await get_browser(context)
     status = await msg.reply_text("📤 استلمت الصورة. أفتح Hunyuan وأرفعها الآن…")
 
     progress_ticks = 0
@@ -469,6 +566,7 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
