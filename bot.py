@@ -34,6 +34,9 @@ SHOTS_DIR = SESSION_DIR / "screens"
 EVENTS_FILE = SESSION_DIR / "events.jsonl"
 META_FILE = SESSION_DIR / "meta.json"
 HUNYUAN_URL = os.environ.get("HUNYUAN_URL", "https://3d.hunyuan.tencent.com/")
+WATCH_INTERVAL_SEC = int(os.environ.get("WATCH_INTERVAL_SEC", "10"))
+WATCH_SCREENSHOT_EVERY_SEC = int(os.environ.get("WATCH_SCREENSHOT_EVERY_SEC", "30"))
+WATCH_MAX_MIN = int(os.environ.get("WATCH_MAX_MIN", "30"))
 
 for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, SESSION_DIR, SHOTS_DIR):
     p.mkdir(parents=True, exist_ok=True)
@@ -214,37 +217,41 @@ class Browser:
             return {"w": 1365, "h": 768}
 
     async def fast_screenshot(self, path: Path):
+        """Bounded screenshot with browser and X11 fallbacks."""
         if not self.page:
             raise RuntimeError("Browser not started")
-        first_error = None
+        errors=[]
         try:
-            await self.page.screenshot(
-                path=str(path),
-                full_page=False,
-                timeout=7000,
-                animations="disabled",
-                caret="hide",
+            await asyncio.wait_for(
+                self.page.screenshot(path=str(path), full_page=False, timeout=3000, animations="disabled", caret="hide"),
+                timeout=4.0,
             )
             return
         except Exception as e:
-            first_error = e
-        session = None
+            errors.append(f"playwright:{e}")
+        session=None
         try:
-            session = await self.context.new_cdp_session(self.page)
-            result = await session.send("Page.captureScreenshot", {
-                "format": "png",
-                "fromSurface": True,
-                "captureBeyondViewport": False,
-            })
+            session=await self.context.new_cdp_session(self.page)
+            result=await asyncio.wait_for(session.send("Page.captureScreenshot", {
+                "format":"png", "fromSurface":True, "captureBeyondViewport":False
+            }), timeout=4.0)
             path.write_bytes(base64.b64decode(result["data"]))
-        except Exception:
-            raise first_error or RuntimeError("Screenshot failed")
+            return
+        except Exception as e:
+            errors.append(f"cdp:{e}")
         finally:
             if session:
-                try:
-                    await session.detach()
-                except Exception:
-                    pass
+                try: await session.detach()
+                except Exception: pass
+        if shutil.which("scrot"):
+            try:
+                proc=await asyncio.create_subprocess_exec("scrot", "-o", str(path), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await asyncio.wait_for(proc.wait(), timeout=4.0)
+                if proc.returncode==0 and path.exists() and path.stat().st_size>0:
+                    return
+            except Exception as e:
+                errors.append(f"scrot:{e}")
+        raise RuntimeError("Screenshot failed | "+" | ".join(errors[-3:]))
 
     async def screenshot_cursor(self, path: Path, x: int, y: int):
         if not self.page:
@@ -323,6 +330,27 @@ class Browser:
             except Exception:
                 pass
         return {"url": url, "title": title, "viewport": await self.viewport()}
+
+    async def generation_state(self):
+        if not self.page:
+            return {"status":"no_page","remaining_sec":None,"queue_count":None,"text":""}
+        script=r"""
+        () => {
+          const txt=(document.body?.innerText||'').replace(/\s+/g,' ').trim();
+          const rem=txt.match(/预计还需\s*(\d+)\s*秒/);
+          const queue=txt.match(/前方\s*(\d+)\s*个任务/) || txt.match(/大概\s*(\d+)\s*秒后开始/);
+          const ready=/(^|\s)(下载|导出|Download|Export)(\s|$)/i.test(txt) || /\b(GLB|OBJ|FBX)\b/i.test(txt);
+          let status='unknown';
+          if(ready) status='ready';
+          else if(rem || /生成中|正在生成|纹理生成|几何生成/.test(txt)) status='generating';
+          else if(queue || /排队|队列|等待生成/.test(txt)) status='queued';
+          return {status, remaining_sec:rem?Number(rem[1]):null, queue_count:queue?Number(queue[1]):null, text:txt.slice(0,3500)};
+        }
+        """
+        try:
+            return await asyncio.wait_for(self.page.evaluate(script), timeout=3.5)
+        except Exception as e:
+            return {"status":"dom_error","remaining_sec":None,"queue_count":None,"text":"","error":str(e)}
 
     async def find_text_target(self, query: str):
         if not self.page:
@@ -557,6 +585,101 @@ async def record_observation(context, action="snapshot", extra=None):
     return await record_action(context, action, noop, extra=extra or {}, screenshot=True, meaningful=False)
 
 
+async def record_watch_observation(application, state: dict, *, screenshot=True):
+    browser=application.bot_data["browser"]
+    st=application.bot_data.setdefault("manual_state", {"x":680,"y":380,"step":15})
+    meta=ensure_session(); now=time.time(); seq=int(meta.get("event_count",0))+1
+    page_info=await browser.page_info(); shot=None
+    if screenshot:
+        shot=await capture_session_screenshot(browser, seq, "generation_watch", "after", st)
+    ended=time.time()
+    event={
+        "seq":seq,"action":"generation_watch","intent_guess":"observe_generation",
+        "started_at":now,"started_at_utc":iso_utc(now),"ended_at":ended,"duration_sec":round(ended-now,3),
+        "elapsed_from_session_sec":round(now-float(meta["started_at"]),3),
+        "wait_since_previous_event_sec":None if not meta.get("last_event_at") else round(now-float(meta["last_event_at"]),3),
+        "wait_since_previous_meaningful_action_sec":None if not meta.get("last_meaningful_at") else round(now-float(meta["last_meaningful_at"]),3),
+        "cursor":{"x":int(st.get("x",680)),"y":int(st.get("y",380)),"step_px":int(st.get("step",15))},
+        "element_before":None,"page_before":page_info,"page_after":page_info,
+        "screenshot_before":None,"screenshot_after":str(shot.relative_to(SESSION_DIR)) if shot else None,
+        "extra":state,"result":state,"error":None,"meaningful":False,
+    }
+    append_event(event); meta["event_count"]=seq; meta["last_event_at"]=now; save_meta(meta)
+    return event
+
+
+def watch_status_text(state: dict, elapsed: float) -> str:
+    status=state.get("status") or "unknown"; rem=state.get("remaining_sec"); q=state.get("queue_count")
+    if status=="queued": return f"🟡 بالطابور"+(f" | قدامك {q} مهمة" if q is not None else "")
+    if status=="generating": return f"🟠 جاري التوليد"+(f" | تقريباً {rem}ث باقي" if rem is not None else "")
+    if status=="ready": return "🟢 النتيجة تبدو جاهزة"
+    if status=="dom_error": return "⚠️ الصفحة ثقيلة، المتابعة مستمرة"
+    return f"⚪ الحالة غير محسومة | مرّ {int(elapsed)}ث"
+
+
+async def generation_watch_loop(application, chat_id:int):
+    browser=application.bot_data["browser"]
+    application.bot_data["generation_watch_stop"]=False
+    started=time.time(); last_shot=0.0; seen_active=False; unknown_after_active=0; final_event=None; final_state=None
+    msg=await application.bot.send_message(chat_id=chat_id,text="⏳ بدأت متابعة التوليد. ما راح أضغط أي زر؛ فقط أسجل الوقت والحالة ولقطات دورية.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف المتابعة",callback_data="menu:watchstop"),InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control")]]))
+    try:
+        while time.time()-started < WATCH_MAX_MIN*60:
+            if application.bot_data.get("generation_watch_stop"): break
+            elapsed=time.time()-started
+            async with browser.control_lock:
+                state=await browser.generation_state(); state["watch_elapsed_sec"]=round(elapsed,1)
+                status=state.get("status")
+                if status in ("queued","generating"):
+                    seen_active=True; unknown_after_active=0
+                elif seen_active and status=="unknown": unknown_after_active+=1
+                else: unknown_after_active=0
+                do_shot=(time.time()-last_shot>=WATCH_SCREENSHOT_EVERY_SEC) or status=="ready"
+                final_event=await record_watch_observation(application,state,screenshot=do_shot)
+                if do_shot: last_shot=time.time()
+            try:
+                await msg.edit_text("⏳ متابعة Hunyuan تلقائياً\n"+watch_status_text(state,elapsed)+f"\n🕒 مرّ {int(elapsed)} ثانية من بدء المتابعة\n📸 اللقطات تنحفظ داخل الجلسة كل {WATCH_SCREENSHOT_EVERY_SEC}ث.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف المتابعة",callback_data="menu:watchstop"),InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control")]]))
+            except Exception: pass
+            final_state=state
+            if status=="ready": break
+            if seen_active and unknown_after_active>=3 and elapsed>=30:
+                final_state=dict(state); final_state["status"]="probable_ready"; break
+            await asyncio.sleep(max(3,WATCH_INTERVAL_SEC))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.exception("Generation watcher failed"); final_state={"status":"watch_error","error":str(e)}
+    finally:
+        application.bot_data["generation_watch_task"]=None; application.bot_data["generation_watch_stop"]=False
+    elapsed=time.time()-started; status=(final_state or {}).get("status")
+    if status in ("ready","probable_ready"):
+        caption=("✅ خلص وقت الانتظار أو اختفت حالة التوليد.\n"+f"⏱ الوقت المسجل: {elapsed:.1f} ثانية.\n"+"🎮 هسه إنت علّمني التنزيل: افتح الموس واضغط Download/下载، وبعدها اختَر الصيغة إذا ظهرت. كل ضغطة تنحفظ.")
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 موس التنزيل",callback_data="menu:control"),InlineKeyboardButton("🔎 اضغط كتابة Download",callback_data="menu:textclick")],[InlineKeyboardButton("📦 حفظ وإرسال الجلسة",callback_data="menu:session")]])
+        rel=final_event.get("screenshot_after") if final_event else None; path=SESSION_DIR/rel if rel else None
+        if path and path.exists():
+            try:
+                with path.open("rb") as f: await application.bot.send_photo(chat_id=chat_id,photo=f,caption=caption[:1000],reply_markup=kb)
+                return
+            except Exception: pass
+        await application.bot.send_message(chat_id=chat_id,text=caption,reply_markup=kb)
+    else:
+        await application.bot.send_message(chat_id=chat_id,text=f"⏹ توقفت المتابعة بعد {elapsed:.1f}ث. الجلسة محفوظة، وتگدر تفتح الموس.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control"),InlineKeyboardButton("📦 حفظ الجلسة",callback_data="menu:session")]]))
+
+
+def start_generation_watch(context, chat_id:int):
+    task=context.application.bot_data.get("generation_watch_task")
+    if task and not task.done(): return False
+    context.application.bot_data["generation_watch_stop"]=False
+    context.application.bot_data["generation_watch_task"]=context.application.create_task(generation_watch_loop(context.application,chat_id))
+    return True
+
+
+async def maybe_start_watch_after_event(update:Update, context, event:dict):
+    if (event or {}).get("intent_guess")!="generate_3d": return
+    msg=update.effective_message or (update.callback_query.message if update.callback_query else None)
+    if msg and start_generation_watch(context,msg.chat_id):
+        await msg.reply_text("⏱ سجلت ضغطة Generate وبدأت متابعة التوليد تلقائياً بالخلفية. ما راح ألمس أي زر.")
+
+
 def element_label(event: dict) -> str:
     el = event.get("element_before") or {}
     attrs = el.get("attrs") or {}
@@ -738,6 +861,7 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 التحكم بالموس", callback_data="menu:control"), InlineKeyboardButton("🔎 اضغط كتابة", callback_data="menu:textclick")],
         [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="menu:upload"), InlineKeyboardButton("📸 لقطة + حفظ الوقت", callback_data="menu:snapshot")],
+        [InlineKeyboardButton("⏳ متابعة التوليد", callback_data="menu:watchstart"), InlineKeyboardButton("🛑 إيقاف المتابعة", callback_data="menu:watchstop")],
         [InlineKeyboardButton("📦 حفظ وإرسال الجلسة", callback_data="menu:session")],
         [InlineKeyboardButton("🧹 جلسة جديدة", callback_data="menu:newsession"), InlineKeyboardButton("📊 الحالة", callback_data="menu:status")],
         [InlineKeyboardButton("🏠 فتح Hunyuan", callback_data="menu:open"), InlineKeyboardButton("🔐 تسجيل الدخول", callback_data="menu:login")],
@@ -759,6 +883,7 @@ def control_keyboard(step: int):
         [InlineKeyboardButton("⇧ سكرول", callback_data="ctl:su"), InlineKeyboardButton("⇩ سكرول", callback_data="ctl:sd"), InlineKeyboardButton("📸 لقطة", callback_data="ctl:snapshot")],
         [InlineKeyboardButton("⬅️ رجوع", callback_data="ctl:back"), InlineKeyboardButton("🔄 تحديث", callback_data="ctl:reload"), InlineKeyboardButton("🏠 Hunyuan", callback_data="ctl:home")],
         [InlineKeyboardButton("⌨️ كتابة", callback_data="ctl:type"), InlineKeyboardButton("↵ Enter", callback_data="ctl:enter"), InlineKeyboardButton("Esc", callback_data="ctl:esc")],
+        [InlineKeyboardButton("⏳ تابع التوليد", callback_data="ctl:watchstart"), InlineKeyboardButton("🛑 وقف المتابعة", callback_data="ctl:watchstop")],
         [InlineKeyboardButton("📦 حفظ الجلسة", callback_data="ctl:session"), InlineKeyboardButton("🏠 القائمة", callback_data="ctl:menu")],
     ])
 
@@ -778,7 +903,7 @@ async def send_main_menu(update: Update, context, text=None):
             "• رابط الصفحة قبل وبعد\n"
             "• لقطة قبل الضغط ولقطة بعده\n"
             "• وقت الضغطة ومدة الانتظار من الخطوة السابقة\n\n"
-            "من تكمل دورة ناجحة اضغط 📦 حفظ وإرسال الجلسة."
+            "من تضغط Generate، متابعة التوليد تشتغل تلقائياً وتسجل الوقت ولقطات دورية.\nمن يخلص، يرجعلك موس التنزيل حتى إنت تعلّمني زر Download.\n\nمن تكمل التنزيل اضغط 📦 حفظ وإرسال الجلسة."
         ),
         reply_markup=main_menu(),
     )
@@ -878,12 +1003,15 @@ async def status_cmd(update: Update, context):
     elapsed = time.time() - float(meta["started_at"])
     last = meta.get("last_meaningful_at")
     wait = time.time() - float(last) if last else 0
+    task = context.application.bot_data.get("generation_watch_task")
+    watch = "شغالة 🟠" if task and not task.done() else "متوقفة ⚪"
     await update.effective_message.reply_text(
         f"🟢 وضع التدريب شغال\n"
         f"🧠 الجلسة: {meta.get('session_id')}\n"
         f"🧾 الخطوات المهمة: {meta.get('meaningful_count',0)}\n"
         f"⏱ مدة الجلسة: {elapsed/60:.1f} دقيقة\n"
         f"⏳ منذ آخر خطوة مهمة: {wait:.1f} ثانية\n"
+        f"👁 متابعة التوليد: {watch}\n"
         f"🌐 {browser.page.url if browser.page else ''}",
         reply_markup=main_menu(),
     )
@@ -956,10 +1084,12 @@ async def control_callback(update: Update, context):
                     f"⏱ انتظار من آخر خطوة مهمة: {event.get('wait_since_previous_meaningful_action_sec') or 0:.1f}ث\n"
                     f"🔎 {label[:180]}"
                 )
+                await maybe_start_watch_after_event(update, context, event)
                 dl = (result or {}).get("download") if isinstance(result, dict) else None
                 if dl and Path(dl).exists():
                     with Path(dl).open("rb") as f:
                         await q.message.reply_document(f, filename=Path(dl).name, caption="📦 التقطت ملف التنزيل وسجلت الخطوة.")
+                    await q.message.reply_text("✅ هسه الجلسة كاملة تقريباً. اضغط حفظ وإرسال الجلسة حتى تدزها إلي.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 حفظ وإرسال الجلسة", callback_data="menu:session")]]))
             elif action == "su" or action == "sd":
                 delta = -520 if action == "su" else 520
                 async def do_scroll():
@@ -1032,6 +1162,11 @@ async def control_callback(update: Update, context):
                     return {"key": key}
                 event, _ = await record_action(context, "key", do_key, element=el, extra={"key": key}, screenshot=True, meaningful=True)
                 note = f"⌨️ {key} محفوظ #{event['seq']}"
+            elif action == "watchstart":
+                note = "⏳ بدأت متابعة التوليد بالخلفية." if start_generation_watch(context, q.message.chat_id) else "ℹ️ المتابعة شغالة أصلاً."
+            elif action == "watchstop":
+                context.application.bot_data["generation_watch_stop"] = True
+                note = "🛑 طلبت إيقاف المتابعة. الجلسة تبقى محفوظة."
             elif action == "session":
                 await export_session(update, context)
                 return
@@ -1078,6 +1213,14 @@ async def menu_callback(update: Update, context):
         event, _ = await record_observation(context, "snapshot", {"source": "menu"})
         wait = event.get("wait_since_previous_meaningful_action_sec") or 0
         await q.message.reply_text(f"📸 حفظت لقطة. مرّ {wait:.1f} ثانية من آخر خطوة مهمة.", reply_markup=main_menu())
+    elif action == "watchstart":
+        if start_generation_watch(context, q.message.chat_id):
+            await q.message.reply_text("⏳ بدأت متابعة التوليد. أسجل الوقت ولقطات دورية بدون أي ضغط على الموقع.", reply_markup=main_menu())
+        else:
+            await q.message.reply_text("ℹ️ متابعة التوليد شغالة أصلاً.", reply_markup=main_menu())
+    elif action == "watchstop":
+        context.application.bot_data["generation_watch_stop"] = True
+        await q.message.reply_text("🛑 راح أوقف المتابعة بأقرب دورة فحص. الجلسة ما تنمسح.", reply_markup=main_menu())
     elif action == "session":
         await export_session(update, context)
     elif action == "newsession":
@@ -1119,11 +1262,13 @@ async def text_handler(update: Update, context):
                 f"⏱ الانتظار من آخر خطوة مهمة: {event.get('wait_since_previous_meaningful_action_sec') or 0:.1f}ث"
             )
             await update.effective_message.reply_text(note, reply_markup=main_menu())
+            await maybe_start_watch_after_event(update, context, event)
             await send_event_after_photo(update, event, f"📸 بعد الخطوة #{event['seq']} — {event['intent_guess']}")
             dl = (result or {}).get("download") if isinstance(result, dict) else None
             if dl and Path(dl).exists():
                 with Path(dl).open("rb") as f:
                     await update.effective_message.reply_document(f, filename=Path(dl).name, caption="📦 التقطت التنزيل وسجلته.")
+                await update.effective_message.reply_text("✅ حفظت التنزيل. هسه اضغط حفظ وإرسال الجلسة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 حفظ وإرسال الجلسة", callback_data="menu:session")]]))
         except Exception as e:
             await update.effective_message.reply_text(f"❌ الضغط فشل: {e}", reply_markup=main_menu())
     elif mode == "type_text":
@@ -1185,11 +1330,19 @@ async def post_init(app: Application):
     app.bot_data["browser"] = browser
     vp = await browser.viewport()
     app.bot_data["manual_state"] = {"x": int(vp["w"]) // 2, "y": int(vp["h"]) // 2, "step": 15}
+    app.bot_data["generation_watch_task"] = None
+    app.bot_data["generation_watch_stop"] = False
     ensure_session()
     log.info("Trainer started | noVNC=%s", novnc_url())
 
 
 async def post_shutdown(app: Application):
+    app.bot_data["generation_watch_stop"] = True
+    task=app.bot_data.get("generation_watch_task")
+    if task and not task.done():
+        task.cancel()
+        try: await task
+        except BaseException: pass
     browser = app.bot_data.get("browser")
     if browser:
         await browser.stop()
