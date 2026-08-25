@@ -13,6 +13,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN chmod +x /app/start.sh
+RUN chmod +x /app/start.sh /app/screen_recorder.sh
 
 CMD ["/app/start.sh"]

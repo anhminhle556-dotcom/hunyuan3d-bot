@@ -47,7 +47,9 @@ TIMELINE_FILE = SESSION_DIR / "timeline_frames.jsonl"
 # completely outside the Telegram/Playwright event loop.
 OS_TIMELINE_DIR = SHOTS_DIR / "os_timeline"
 OS_TIMELINE_FILE = SESSION_DIR / "os_timeline.jsonl"
-OS_LATEST = OS_TIMELINE_DIR / "latest.png"
+OS_LATEST = OS_TIMELINE_DIR / "latest.jpg"
+OS_LATEST_OLD = OS_TIMELINE_DIR / "latest.png"
+RECORDER_HEALTH_FILE = SESSION_DIR / "recorder_health.json"
 GEN_STREAM_MARKER = SESSION_DIR / ".generation_stream"
 
 for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, SESSION_DIR, SHOTS_DIR, OS_TIMELINE_DIR):
@@ -147,14 +149,25 @@ def disable_generation_stream():
 
 
 def latest_os_frame() -> Optional[Path]:
-    """Return the latest screenshot produced by the independent shell recorder."""
+    """Return newest frame from the V8 continuous ffmpeg recorder (JPEG) or older PNG recorder."""
     try:
-        if OS_LATEST.exists() and OS_LATEST.stat().st_size > 1000:
-            return OS_LATEST
-        frames = sorted(OS_TIMELINE_DIR.glob("frame_*.png"), key=lambda x: x.stat().st_mtime, reverse=True)
+        for candidate in (OS_LATEST, OS_LATEST_OLD):
+            if candidate.exists() and candidate.stat().st_size > 1000:
+                return candidate
+        frames = list(OS_TIMELINE_DIR.glob("frame_*.jpg")) + list(OS_TIMELINE_DIR.glob("frame_*.png"))
+        frames.sort(key=lambda x: x.stat().st_mtime, reverse=True)
         return frames[0] if frames else None
     except Exception:
         return None
+
+
+def recorder_health() -> dict:
+    try:
+        if RECORDER_HEALTH_FILE.exists():
+            return json.loads(RECORDER_HEALTH_FILE.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        pass
+    return {}
 
 
 def read_events() -> list:
@@ -1118,7 +1131,7 @@ async def export_session(update: Update, context):
         "workflow.json: compact ordered workflow with observed waits.\n"
         "replay_plan.py: code-like Playwright replay plan generated from the actions.\n"
         "screens/: before/after screenshots for real page actions.\n"
-        "os_timeline.jsonl + screens/os_timeline/: OS-level screenshots captured by a separate shell process every 5s, independent from Python/Playwright/WebGL.\n"
+        "os_timeline.jsonl + screens/os_timeline/: V8 continuous ffmpeg X11 JPEG timeline, independent from Python/Playwright/WebGL and automatically rotated to protect disk space.\nrecorder_health.json: recorder heartbeat, last frame time and ffmpeg restart count.\n"
         "timeline_frames.jsonl + screens/timeline/: Python-side X11 screenshots (secondary).\n"
         "generation_frames.jsonl + screens/generation_frames/: generation-specific Python-side frames (secondary).\n"
         "summary.json: session metadata.\n\n"
@@ -1327,6 +1340,20 @@ async def status_cmd(update: Update, context):
     wait = time.time() - float(last) if last else 0
     task = context.application.bot_data.get("generation_watch_task")
     watch = "شغالة 🟠" if task and not task.done() else "متوقفة ⚪"
+    health = recorder_health()
+    try:
+        du = shutil.disk_usage(DATA_DIR)
+        free_mb = du.free / (1024 * 1024)
+        used_mb = du.used / (1024 * 1024)
+        disk_line = f"💾 /data مستخدم {used_mb:.0f}MB | فارغ {free_mb:.0f}MB"
+    except Exception:
+        disk_line = "💾 تعذر قراءة مساحة /data"
+    last_frame_epoch = float(health.get("last_frame_epoch") or 0)
+    frame_age = (time.time() - last_frame_epoch) if last_frame_epoch else None
+    rec_state = health.get("status") or "unknown"
+    rec_restarts = health.get("ffmpeg_restarts", 0)
+    rec_line = (f"🖥 مسجل V8: {rec_state} | آخر فريم قبل {frame_age:.1f}ث | restarts={rec_restarts}"
+                if frame_age is not None else f"🖥 مسجل V8: {rec_state} | ينتظر أول فريم")
     await update.effective_message.reply_text(
         f"🟢 وضع التدريب شغال\n"
         f"🧠 الجلسة: {meta.get('session_id')}\n"
@@ -1335,7 +1362,8 @@ async def status_cmd(update: Update, context):
         f"⏳ منذ آخر خطوة مهمة: {wait:.1f} ثانية\n"
         f"👁 متابعة التوليد: {watch}\n"
         f"📡 بث لقطات التوليد الخارجي: {'شغال ✅' if GEN_STREAM_MARKER.exists() else 'متوقف ⚪'}\n"
-        f"🖥 مسجل OS المستقل: {'عنده لقطة ✅' if latest_os_frame() else 'ينتظر أول لقطة ⏳'} | كل 5ث\n"
+        f"{rec_line}\n"
+        f"{disk_line}\n"
         f"📸 تسجيل Python الإضافي: {'شغال ✅' if context.application.bot_data.get('timeline_task') and not context.application.bot_data.get('timeline_task').done() else 'متوقف ❌'} | كل {TIMELINE_FRAME_EVERY_SEC}ث\n"
         f"🌐 {browser.page.url if browser.page else ''}",
         reply_markup=main_menu(),
