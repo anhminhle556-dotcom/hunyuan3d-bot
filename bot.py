@@ -79,14 +79,19 @@ class HunyuanBrowser:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--start-maximized",
+                "--restore-last-session",
             ],
         )
         pages = self.context.pages
-        self.page = pages[0] if pages else await self.context.new_page()
-        try:
-            await self.page.goto(HUNYUAN_URL, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            log.warning("Initial navigation failed: %s", e)
+        restored = [p for p in pages if p.url not in ("", "about:blank")]
+        self.page = restored[0] if restored else (pages[0] if pages else await self.context.new_page())
+        # With the persistent /data profile, prefer Chrome's restored tab. Only
+        # navigate to the root when there really is no restored page at all.
+        if self.page.url in ("", "about:blank"):
+            try:
+                await self.page.goto(HUNYUAN_URL, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                log.warning("Initial navigation failed: %s", e)
 
     async def stop(self):
         try:
@@ -125,17 +130,66 @@ class HunyuanBrowser:
                 continue
         return False
 
+    async def page_mode(self) -> str:
+        """Classify the current Hunyuan SPA without clicking anything."""
+        assert self.page
+        try:
+            body = await self.page.locator("body").inner_text(timeout=2500)
+        except Exception:
+            body = ""
+
+        # Strong markers for the image/text-to-3D creator seen in Hunyuan.
+        if re.search(r"图/文生3D|图生3D|文生3D|上传图片|Upload\s*Image", body, re.I):
+            return "image3d"
+
+        # Hunyuan World Model is a different product surface. It may also have
+        # file inputs, so NEVER treat a generic input[type=file] as Image-to-3D.
+        if re.search(r"世界模型|世界生成|世界重建|360.?全景图|实时生世界", body, re.I):
+            return "world"
+
+        if re.search(r"欢迎来到腾讯混元3D|登录后开启3D创作之旅", body, re.I):
+            return "login"
+        return "unknown"
+
     async def prepare_image_to_3d(self):
         assert self.page
-        # If the upload control is already present, do not navigate away.
-        if await self.page.locator('input[type="file"]').count():
+        mode = await self.page_mode()
+        if mode == "image3d":
             return
 
-        await self._click_text(r"3D\s*Creation|Creation|3D创作|3D\s*创作|创作")
-        await self._click_text(r"Image\s*(?:to|[-→])\s*3D|Image.*3D|图生\s*3D|图片.*3D")
+        # The previous build navigated to the root URL immediately before every
+        # job. The root can open Hunyuan World Model. If that just happened,
+        # browser history normally contains the correct Image-to-3D page, so try
+        # Back only; this is navigation-only and cannot spend generation credit.
+        if mode == "world":
+            for _ in range(2):
+                try:
+                    await self.page.go_back(wait_until="domcontentloaded", timeout=12000)
+                    await self.page.wait_for_timeout(1200)
+                except Exception:
+                    break
+                if await self.page_mode() == "image3d":
+                    return
 
-        # Give SPA transitions time to render.
-        await self.page.wait_for_timeout(1800)
+            raise RuntimeError(
+                "المتصفح موجود في صفحة Hunyuan World Model (世界模型)، مو صفحة 图/文生3D. "
+                "جلسة الدخول شغالة؛ افتح واجهة noVNC وارجع إلى صفحة 图/文生3D ثم أرسل الصورة."
+            )
+
+        if mode == "login":
+            raise RuntimeError("جلسة الدخول غير مفعلة؛ افتح /login وسجّل الدخول أولاً.")
+
+        # On an unknown page, only click explicit Image-to-3D labels. Do not use
+        # broad words such as 'Creation/创作' because they also exist on World Model.
+        clicked = await self._click_text(r"Image\s*(?:to|[-→])\s*3D|Image.*3D|图生\s*3D|图片.*3D|图/文生3D")
+        if clicked:
+            await self.page.wait_for_timeout(1600)
+            if await self.page_mode() == "image3d":
+                return
+
+        raise RuntimeError(
+            "ما قدرت أوصل بأمان إلى صفحة 图/文生3D. افتح /login، خلّ المتصفح على صفحة رفع الصورة، وبعدها أرسل الصورة."
+        )
 
     async def _attached_image_count(self) -> int:
         """Return how many local files are currently attached to file inputs."""
@@ -373,7 +427,9 @@ class HunyuanBrowser:
 
     async def generate(self, image_path: Path, progress_cb=None) -> Path:
         async with self.lock:
-            await self.open_home()
+            # IMPORTANT: do not navigate to HUNYUAN_URL here. The root URL can
+            # open Hunyuan World Model and destroy the user's already-correct
+            # Image-to-3D page state. Work on the current tab instead.
             await self.upload_image(image_path)
             clicked = await self.click_generate()
             if not clicked:
@@ -419,10 +475,13 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🟠 يوجد توليد قيد التنفيذ. استخدم /shot أو /status، ولا أفتح صفحة جديدة حتى لا يتعطل الطلب الحالي."
         )
         return
-    try:
-        await browser.open_home()
-    except Exception:
-        pass
+    # Preserve the current page. /login is a remote-screen link, not a command
+    # that should navigate away from an already-correct Image-to-3D screen.
+    if not browser.page or browser.page.url in ("", "about:blank"):
+        try:
+            await browser.open_home()
+        except Exception:
+            pass
     await update.effective_message.reply_text(
         "🔐 افتح واجهة المتصفح وسجّل دخولك يدويًا إلى Hunyuan.\n"
         "بعدها لا تسجّل خروج؛ الجلسة تنحفظ داخل Volume.\n\n"
@@ -452,8 +511,18 @@ async def shot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = JOBS_DIR / f"screen-{int(time.time())}.png"
     try:
         await browser.screenshot(path)
+        mode = await browser.page_mode() if browser.page else "unknown"
+        mode_label = {
+            "image3d": "✅ صفحة 图/文生3D جاهزة",
+            "world": "⚠️ صفحة 世界模型 (مو Image-to-3D)",
+            "login": "🔐 صفحة تسجيل الدخول",
+            "unknown": "❔ صفحة غير معروفة",
+        }.get(mode, mode)
         with path.open("rb") as f:
-            await update.effective_message.reply_photo(f, caption=f"🖥 حالة المتصفح\n{browser.page.url if browser.page else ''}")
+            await update.effective_message.reply_photo(
+                f,
+                caption=f"🖥 حالة المتصفح\n{mode_label}\n{browser.page.url if browser.page else ''}"
+            )
     except Exception as e:
         await update.effective_message.reply_text(f"❌ فشل أخذ اللقطة: {e}")
     finally:
@@ -465,8 +534,16 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     browser = await get_browser(context)
     busy = browser.lock.locked()
     url = browser.page.url if browser.page else "غير متاح"
+    mode = await browser.page_mode() if browser.page else "unknown"
+    mode_label = {
+        "image3d": "✅ 图/文生3D",
+        "world": "⚠️ 世界模型 — مو صفحة التوليد المطلوبة",
+        "login": "🔐 تسجيل الدخول",
+        "unknown": "❔ غير معروف",
+    }.get(mode, mode)
     await update.effective_message.reply_text(
-        f"{'🟠 يوجد توليد قيد التنفيذ' if busy else '🟢 جاهز'}\n🌐 الصفحة الحالية: {url}"
+        f"{'🟠 يوجد توليد قيد التنفيذ' if busy else '🟢 جاهز'}\n"
+        f"🧭 الواجهة: {mode_label}\n🌐 الصفحة الحالية: {url}"
     )
 
 
