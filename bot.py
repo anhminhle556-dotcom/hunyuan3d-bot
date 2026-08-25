@@ -130,6 +130,31 @@ class HunyuanBrowser:
                 continue
         return False
 
+    async def _creator_upload_ui_present(self) -> bool:
+        """True only on the actual Image/Text-to-3D upload workspace."""
+        assert self.page
+        try:
+            body = await self.page.locator("body").inner_text(timeout=2500)
+        except Exception:
+            body = ""
+
+        # A visible upload label is the strongest signal.
+        if re.search(r"上传图片|Upload\s*Image|Choose\s*Image|Select\s*Image", body, re.I):
+            return True
+
+        # Some builds hide the file input behind a custom control. Only accept
+        # image-capable inputs; do not treat arbitrary file inputs as the creator.
+        inputs = self.page.locator('input[type="file"]')
+        try:
+            for i in range(await inputs.count()):
+                el = inputs.nth(i)
+                accept = ((await el.get_attribute("accept")) or "").lower()
+                if not accept or "image" in accept:
+                    return True
+        except Exception:
+            pass
+        return False
+
     async def page_mode(self) -> str:
         """Classify the current Hunyuan SPA without clicking anything."""
         assert self.page
@@ -138,24 +163,118 @@ class HunyuanBrowser:
         except Exception:
             body = ""
 
-        # Strong markers for the image/text-to-3D creator seen in Hunyuan.
-        if re.search(r"图/文生3D|图生3D|文生3D|上传图片|Upload\s*Image", body, re.I):
+        # Important: the Hunyuan home/landing page contains the words 图/文生3D,
+        # but it is NOT the upload workspace. Require a real upload UI first.
+        if await self._creator_upload_ui_present():
             return "image3d"
 
         # Hunyuan World Model is a different product surface. It may also have
-        # file inputs, so NEVER treat a generic input[type=file] as Image-to-3D.
+        # file inputs, so classify its distinctive text before generic landing text.
         if re.search(r"世界模型|世界生成|世界重建|360.?全景图|实时生世界", body, re.I):
             return "world"
 
         if re.search(r"欢迎来到腾讯混元3D|登录后开启3D创作之旅", body, re.I):
             return "login"
+
+        # Main Hunyuan 3D landing page: shows 图/文生3D plus a start button,
+        # but there is no image upload control yet.
+        if re.search(r"图/文生3D|图生3D|文生3D", body, re.I) and re.search(
+            r"立即开始|开始创作|立即体验|Start\s*Now|Get\s*Started", body, re.I
+        ):
+            return "image3d_landing"
+
         return "unknown"
+
+    async def _enter_image3d_from_landing(self) -> bool:
+        """Open the Image/Text-to-3D creator from the Hunyuan landing page."""
+        assert self.page
+        start_pattern = re.compile(r"立即开始|开始创作|立即体验|Start\s*Now|Get\s*Started", re.I)
+
+        # Prefer a button close to the 图/文生3D card. This avoids clicking a
+        # different product's start button if the home page has several cards.
+        labels = self.page.get_by_text(re.compile(r"图/文生3D|图生3D|文生3D", re.I))
+        buttons = self.page.get_by_role("button", name=start_pattern)
+        try:
+            label_boxes = []
+            for i in range(min(await labels.count(), 6)):
+                loc = labels.nth(i)
+                if await loc.is_visible(timeout=300):
+                    box = await loc.bounding_box()
+                    if box:
+                        label_boxes.append(box)
+
+            candidates = []
+            for i in range(min(await buttons.count(), 12)):
+                btn = buttons.nth(i)
+                if not await btn.is_visible(timeout=300) or not await btn.is_enabled(timeout=300):
+                    continue
+                box = await btn.bounding_box()
+                if not box:
+                    continue
+                if label_boxes:
+                    bx = box["x"] + box["width"] / 2
+                    by = box["y"] + box["height"] / 2
+                    dist = min(
+                        (bx - (lb["x"] + lb["width"] / 2)) ** 2
+                        + (by - (lb["y"] + lb["height"] / 2)) ** 2
+                        for lb in label_boxes
+                    )
+                else:
+                    dist = i
+                candidates.append((dist, i, btn))
+
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            for _, _, btn in candidates:
+                try:
+                    await btn.click(timeout=5000)
+                    # The SPA can take a moment to mount the upload widget.
+                    deadline = time.monotonic() + 12
+                    while time.monotonic() < deadline:
+                        await self.page.wait_for_timeout(500)
+                        if await self._creator_upload_ui_present():
+                            return True
+                    # If this button did not open the creator, do not click other
+                    # unrelated cards blindly after navigation/state changes.
+                    return False
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Fallback only when there is a single explicit start button on screen.
+        try:
+            texts = self.page.get_by_text(start_pattern)
+            visible = []
+            for i in range(min(await texts.count(), 12)):
+                loc = texts.nth(i)
+                if await loc.is_visible(timeout=300):
+                    visible.append(loc)
+            if len(visible) == 1:
+                await visible[0].click(timeout=5000)
+                deadline = time.monotonic() + 12
+                while time.monotonic() < deadline:
+                    await self.page.wait_for_timeout(500)
+                    if await self._creator_upload_ui_present():
+                        return True
+        except Exception:
+            pass
+        return False
 
     async def prepare_image_to_3d(self):
         assert self.page
         mode = await self.page_mode()
         if mode == "image3d":
             return
+
+        # The main Hunyuan landing page is safe, but it is not the upload page.
+        # Enter the explicit 图/文生3D creator before touching any file input.
+        if mode == "image3d_landing":
+            if await self._enter_image3d_from_landing():
+                return
+            raise RuntimeError(
+                "وصلت لواجهة Hunyuan الرئيسية لكن ما قدرت أفتح صفحة رفع 图/文生3D تلقائياً. "
+                "أوقفت الطلب قبل صرف أي نقطة."
+            )
 
         # The previous build navigated to the root URL immediately before every
         # job. The root can open Hunyuan World Model. If that just happened,
@@ -513,7 +632,8 @@ async def shot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await browser.screenshot(path)
         mode = await browser.page_mode() if browser.page else "unknown"
         mode_label = {
-            "image3d": "✅ صفحة 图/文生3D جاهزة",
+            "image3d": "✅ صفحة رفع 图/文生3D جاهزة",
+            "image3d_landing": "🟡 واجهة Hunyuan الرئيسية — راح أفتح 图/文生3D تلقائياً عند إرسال صورة",
             "world": "⚠️ صفحة 世界模型 (مو Image-to-3D)",
             "login": "🔐 صفحة تسجيل الدخول",
             "unknown": "❔ صفحة غير معروفة",
@@ -536,7 +656,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = browser.page.url if browser.page else "غير متاح"
     mode = await browser.page_mode() if browser.page else "unknown"
     mode_label = {
-        "image3d": "✅ 图/文生3D",
+        "image3d": "✅ صفحة رفع 图/文生3D",
+        "image3d_landing": "🟡 الرئيسية — جاهز للدخول إلى 图/文生3D تلقائياً",
         "world": "⚠️ 世界模型 — مو صفحة التوليد المطلوبة",
         "login": "🔐 تسجيل الدخول",
         "unknown": "❔ غير معروف",
