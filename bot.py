@@ -163,25 +163,34 @@ class HunyuanBrowser:
         except Exception:
             body = ""
 
-        # Important: the Hunyuan home/landing page contains the words 图/文生3D,
-        # but it is NOT the upload workspace. Require a real upload UI first.
+        # Important: the real creator workspace is the only place where we
+        # accept an image upload control as a positive signal.
         if await self._creator_upload_ui_present():
             return "image3d"
-
-        # Hunyuan World Model is a different product surface. It may also have
-        # file inputs, so classify its distinctive text before generic landing text.
-        if re.search(r"世界模型|世界生成|世界重建|360.?全景图|实时生世界", body, re.I):
-            return "world"
 
         if re.search(r"欢迎来到腾讯混元3D|登录后开启3D创作之旅", body, re.I):
             return "login"
 
-        # Main Hunyuan 3D landing page: shows 图/文生3D plus a start button,
-        # but there is no image upload control yet.
+        # Main Hunyuan 3D landing page. NOTE: this page also contains a card
+        # called "3D世界模型". Therefore the generic word 世界模型 MUST NOT be
+        # used to classify this page as World Model. The combination below is
+        # specific to the Image/Text-to-3D hero card shown on the landing page.
         if re.search(r"图/文生3D|图生3D|文生3D", body, re.I) and re.search(
             r"立即开始|开始创作|立即体验|Start\s*Now|Get\s*Started", body, re.I
         ):
             return "image3d_landing"
+
+        # World Model has a distinctive top navigation. Require at least two of
+        # those markers instead of matching the isolated 世界模型 card on home.
+        world_markers = [
+            r"世界生成",
+            r"世界重建",
+            r"360.?全景图",
+            r"实时生世界",
+        ]
+        world_hits = sum(1 for pat in world_markers if re.search(pat, body, re.I))
+        if world_hits >= 2:
+            return "world"
 
         return "unknown"
 
@@ -226,9 +235,21 @@ class HunyuanBrowser:
             candidates.sort(key=lambda x: (x[0], x[1]))
             for _, _, btn in candidates:
                 try:
+                    before_pages = set(self.context.pages) if self.context else set()
                     await btn.click(timeout=5000)
+                    # Some Hunyuan builds navigate in-place; others can open a
+                    # new tab. If a new page appears, follow it explicitly.
+                    await self.page.wait_for_timeout(800)
+                    if self.context:
+                        new_pages = [p for p in self.context.pages if p not in before_pages]
+                        if new_pages:
+                            self.page = new_pages[-1]
+                            try:
+                                await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                            except Exception:
+                                pass
                     # The SPA can take a moment to mount the upload widget.
-                    deadline = time.monotonic() + 12
+                    deadline = time.monotonic() + 15
                     while time.monotonic() < deadline:
                         await self.page.wait_for_timeout(500)
                         if await self._creator_upload_ui_present():
