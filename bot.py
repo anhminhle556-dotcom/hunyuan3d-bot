@@ -36,6 +36,9 @@ META_FILE = SESSION_DIR / "meta.json"
 HUNYUAN_URL = os.environ.get("HUNYUAN_URL", "https://3d.hunyuan.tencent.com/")
 WATCH_INTERVAL_SEC = int(os.environ.get("WATCH_INTERVAL_SEC", "10"))
 WATCH_SCREENSHOT_EVERY_SEC = int(os.environ.get("WATCH_SCREENSHOT_EVERY_SEC", "30"))
+# Hard X11 generation frames are completely independent from Playwright/DOM.
+# This is the safety net that keeps recording even when the WebGL page is busy.
+GEN_FRAME_EVERY_SEC = int(os.environ.get("GEN_FRAME_EVERY_SEC", "10"))
 WATCH_MAX_MIN = int(os.environ.get("WATCH_MAX_MIN", "30"))
 
 for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, SESSION_DIR, SHOTS_DIR):
@@ -252,6 +255,32 @@ class Browser:
             except Exception as e:
                 errors.append(f"scrot:{e}")
         raise RuntimeError("Screenshot failed | "+" | ".join(errors[-3:]))
+
+    async def x11_screenshot(self, path: Path):
+        """Capture the X11 display directly, without touching Playwright or the page DOM.
+
+        This is intentionally used during Hunyuan generation because WebGL can make
+        page.evaluate/page.screenshot slow or temporarily unresponsive while Xvfb is
+        still rendering the visible browser window normally.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not shutil.which("scrot"):
+            raise RuntimeError("scrot is not installed")
+        proc = await asyncio.create_subprocess_exec(
+            "scrot", "-o", str(path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":99")},
+        )
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=4.0)
+        except asyncio.TimeoutError:
+            try: proc.kill()
+            except Exception: pass
+            raise RuntimeError("X11 screenshot timed out")
+        if proc.returncode != 0 or not path.exists() or path.stat().st_size < 1000:
+            raise RuntimeError("X11 screenshot failed: " + (err or b"").decode("utf-8", "ignore")[-500:])
+        return path
 
     async def screenshot_cursor(self, path: Path, x: int, y: int):
         if not self.page:
@@ -585,6 +614,60 @@ async def record_observation(context, action="snapshot", extra=None):
     return await record_action(context, action, noop, extra=extra or {}, screenshot=True, meaningful=False)
 
 
+GEN_FRAMES_FILE = SESSION_DIR / "generation_frames.jsonl"
+GEN_FRAMES_DIR = SHOTS_DIR / "generation_frames"
+
+
+def append_generation_frame(row: dict):
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    GEN_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    with GEN_FRAMES_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+async def generation_frame_loop(application, chat_id: int, watch_started: float):
+    """Hard screenshot heartbeat.
+
+    No browser lock, no page.evaluate and no Playwright screenshot is used here.
+    It keeps recording the visible X11 display even if Hunyuan's WebGL DOM is busy.
+    """
+    browser = application.bot_data["browser"]
+    frame_no = 0
+    while not application.bot_data.get("generation_watch_stop"):
+        frame_no += 1
+        now = time.time()
+        elapsed = now - watch_started
+        stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path = GEN_FRAMES_DIR / f"gen_{frame_no:04d}_{stamp}_{int((now%1)*1000):03d}.png"
+        error = None
+        rel = None
+        try:
+            await browser.x11_screenshot(path)
+            rel = str(path.relative_to(SESSION_DIR))
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            log.warning("Hard generation screenshot failed: %s", e)
+        # page.url is a local Playwright property; it does not execute DOM JS.
+        try:
+            url = browser.page.url if browser.page else ""
+        except Exception:
+            url = ""
+        append_generation_frame({
+            "frame": frame_no,
+            "captured_at": now,
+            "captured_at_utc": iso_utc(now),
+            "watch_elapsed_sec": round(elapsed, 3),
+            "screenshot": rel,
+            "url": url,
+            "error": error,
+            "source": "x11_scrot_independent_heartbeat",
+        })
+        try:
+            await asyncio.sleep(max(2, GEN_FRAME_EVERY_SEC))
+        except asyncio.CancelledError:
+            break
+
+
 async def record_watch_observation(application, state: dict, *, screenshot=True):
     browser=application.bot_data["browser"]
     st=application.bot_data.setdefault("manual_state", {"x":680,"y":380,"step":15})
@@ -620,25 +703,56 @@ def watch_status_text(state: dict, elapsed: float) -> str:
 async def generation_watch_loop(application, chat_id:int):
     browser=application.bot_data["browser"]
     application.bot_data["generation_watch_stop"]=False
-    started=time.time(); last_shot=0.0; seen_active=False; unknown_after_active=0; final_event=None; final_state=None
-    msg=await application.bot.send_message(chat_id=chat_id,text="⏳ بدأت متابعة التوليد. ما راح أضغط أي زر؛ فقط أسجل الوقت والحالة ولقطات دورية.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف المتابعة",callback_data="menu:watchstop"),InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control")]]))
+    started=time.time(); seen_active=False; unknown_after_active=0; final_event=None; final_state=None
+
+    # Start the hard screenshot heartbeat FIRST. It is deliberately independent from
+    # all DOM/status checks, so generation frames continue even if Hunyuan gets heavy.
+    frame_task = application.create_task(generation_frame_loop(application, chat_id, started))
+    application.bot_data["generation_frame_task"] = frame_task
+
+    msg=await application.bot.send_message(
+        chat_id=chat_id,
+        text=("⏳ بدأت متابعة التوليد.\n"
+              f"📸 لقطة حقيقية من شاشة السيرفر كل {GEN_FRAME_EVERY_SEC}ث، مستقلة عن Hunyuan/Playwright.\n"
+              "حتى إذا صفحة الـ3D ثقلت، تسجيل الصور يستمر."),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف المتابعة",callback_data="menu:watchstop"),InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control")]])
+    )
     try:
         while time.time()-started < WATCH_MAX_MIN*60:
             if application.bot_data.get("generation_watch_stop"): break
             elapsed=time.time()-started
-            async with browser.control_lock:
-                state=await browser.generation_state(); state["watch_elapsed_sec"]=round(elapsed,1)
-                status=state.get("status")
-                if status in ("queued","generating"):
-                    seen_active=True; unknown_after_active=0
-                elif seen_active and status=="unknown": unknown_after_active+=1
-                else: unknown_after_active=0
-                do_shot=(time.time()-last_shot>=WATCH_SCREENSHOT_EVERY_SEC) or status=="ready"
-                final_event=await record_watch_observation(application,state,screenshot=do_shot)
-                if do_shot: last_shot=time.time()
+
+            # DOM status is best-effort only. A failure here must never stop X11 frames.
             try:
-                await msg.edit_text("⏳ متابعة Hunyuan تلقائياً\n"+watch_status_text(state,elapsed)+f"\n🕒 مرّ {int(elapsed)} ثانية من بدء المتابعة\n📸 اللقطات تنحفظ داخل الجلسة كل {WATCH_SCREENSHOT_EVERY_SEC}ث.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف المتابعة",callback_data="menu:watchstop"),InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control")]]))
-            except Exception: pass
+                async with browser.control_lock:
+                    state=await asyncio.wait_for(browser.generation_state(), timeout=5.0)
+            except Exception as e:
+                state={"status":"dom_error","remaining_sec":None,"queue_count":None,"text":"","error":str(e)}
+            state["watch_elapsed_sec"]=round(elapsed,1)
+            status=state.get("status")
+            if status in ("queued","generating"):
+                seen_active=True; unknown_after_active=0
+            elif seen_active and status=="unknown":
+                unknown_after_active+=1
+            else:
+                unknown_after_active=0
+
+            # Watch events are metadata only here. Actual generation screenshots are
+            # written by generation_frame_loop into generation_frames.jsonl + screens/.
+            try:
+                final_event=await asyncio.wait_for(record_watch_observation(application,state,screenshot=False), timeout=4.0)
+            except Exception as e:
+                log.warning("Generation metadata record failed but frame heartbeat continues: %s", e)
+
+            try:
+                await msg.edit_text(
+                    "⏳ متابعة Hunyuan تلقائياً\n"+watch_status_text(state,elapsed)+
+                    f"\n🕒 مرّ {int(elapsed)} ثانية من بدء المتابعة"
+                    f"\n📸 لقطة X11 مستقلة كل {GEN_FRAME_EVERY_SEC}ث — ما تعتمد على الصفحة.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف المتابعة",callback_data="menu:watchstop"),InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control")]])
+                )
+            except Exception:
+                pass
             final_state=state
             if status=="ready": break
             if seen_active and unknown_after_active>=3 and elapsed>=30:
@@ -649,21 +763,28 @@ async def generation_watch_loop(application, chat_id:int):
     except Exception as e:
         log.exception("Generation watcher failed"); final_state={"status":"watch_error","error":str(e)}
     finally:
-        application.bot_data["generation_watch_task"]=None; application.bot_data["generation_watch_stop"]=False
+        application.bot_data["generation_watch_stop"]=True
+        try:
+            frame_task.cancel()
+            await asyncio.wait_for(frame_task, timeout=3.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            pass
+        application.bot_data["generation_frame_task"]=None
+        application.bot_data["generation_watch_task"]=None
+        application.bot_data["generation_watch_stop"]=False
+
     elapsed=time.time()-started; status=(final_state or {}).get("status")
     if status in ("ready","probable_ready"):
-        caption=("✅ خلص وقت الانتظار أو اختفت حالة التوليد.\n"+f"⏱ الوقت المسجل: {elapsed:.1f} ثانية.\n"+"🎮 هسه إنت علّمني التنزيل: افتح الموس واضغط Download/下载، وبعدها اختَر الصيغة إذا ظهرت. كل ضغطة تنحفظ.")
+        caption=("✅ خلص وقت الانتظار أو اختفت حالة التوليد.\n"+
+                 f"⏱ الوقت المسجل: {elapsed:.1f} ثانية.\n"+
+                 f"📸 لقطات التوليد محفوظة كل {GEN_FRAME_EVERY_SEC}ث داخل generation_frames.jsonl.\n"+
+                 "🎮 هسه علّمني التنزيل: افتح الموس واضغط Download/下载، وبعدها اختَر الصيغة إذا ظهرت.")
         kb=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 موس التنزيل",callback_data="menu:control"),InlineKeyboardButton("🔎 اضغط كتابة Download",callback_data="menu:textclick")],[InlineKeyboardButton("📦 حفظ وإرسال الجلسة",callback_data="menu:session")]])
-        rel=final_event.get("screenshot_after") if final_event else None; path=SESSION_DIR/rel if rel else None
-        if path and path.exists():
-            try:
-                with path.open("rb") as f: await application.bot.send_photo(chat_id=chat_id,photo=f,caption=caption[:1000],reply_markup=kb)
-                return
-            except Exception: pass
         await application.bot.send_message(chat_id=chat_id,text=caption,reply_markup=kb)
     else:
-        await application.bot.send_message(chat_id=chat_id,text=f"⏹ توقفت المتابعة بعد {elapsed:.1f}ث. الجلسة محفوظة، وتگدر تفتح الموس.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control"),InlineKeyboardButton("📦 حفظ الجلسة",callback_data="menu:session")]]))
-
+        await application.bot.send_message(chat_id=chat_id,text=f"⏹ توقفت المتابعة بعد {elapsed:.1f}ث. لقطات X11 المحفوظة تبقى داخل الجلسة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 فتح الموس",callback_data="menu:control"),InlineKeyboardButton("📦 حفظ الجلسة",callback_data="menu:session")]]))
 
 def start_generation_watch(context, chat_id:int):
     task=context.application.bot_data.get("generation_watch_task")
@@ -821,7 +942,7 @@ async def export_session(update: Update, context):
         "events.jsonl: full machine-readable timeline.\n"
         "workflow.json: compact ordered workflow with observed waits.\n"
         "replay_plan.py: code-like Playwright replay plan generated from the actions.\n"
-        "screens/: before/after screenshots for real page actions.\n"
+        "screens/: before/after screenshots for real page actions.\ngeneration_frames.jsonl + screens/generation_frames/: hard X11 screenshots recorded during 3D generation.\n"
         "summary.json: session metadata.\n\n"
         "Security: browser cookies, passwords and the Chrome profile are NOT exported.\n"
     )
@@ -1331,6 +1452,7 @@ async def post_init(app: Application):
     vp = await browser.viewport()
     app.bot_data["manual_state"] = {"x": int(vp["w"]) // 2, "y": int(vp["h"]) // 2, "step": 15}
     app.bot_data["generation_watch_task"] = None
+    app.bot_data["generation_frame_task"] = None
     app.bot_data["generation_watch_stop"] = False
     ensure_session()
     log.info("Trainer started | noVNC=%s", novnc_url())
