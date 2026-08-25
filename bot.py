@@ -235,6 +235,37 @@ class Browser:
         self.context = None
         self.page: Optional[Page] = None
         self.control_lock = asyncio.Lock()
+        # Download capture is global and passive. Never wrap ordinary clicks in
+        # page.expect_download(), because Hunyuan navigation/WebGL pages can crash
+        # while Playwright is waiting for a download event that will never happen.
+        self.last_download_path: Optional[Path] = None
+        self.last_download_at: float = 0.0
+        self.download_event = asyncio.Event()
+        self._download_tasks = set()
+
+    def _attach_page_events(self, page: Page):
+        try:
+            page.on("download", lambda dl: self._spawn_download_task(dl))
+        except Exception:
+            pass
+
+    def _spawn_download_task(self, download):
+        try:
+            task = asyncio.create_task(self._capture_download(download))
+            self._download_tasks.add(task)
+            task.add_done_callback(lambda t: self._download_tasks.discard(t))
+        except Exception as e:
+            log.warning("Could not start download capture task: %s", e)
+
+    async def _capture_download(self, download):
+        try:
+            path = await self.save_download(download)
+            self.last_download_path = path
+            self.last_download_at = time.time()
+            self.download_event.set()
+            log.info("Captured download: %s", path)
+        except Exception as e:
+            log.warning("Download capture failed: %s", e)
 
     async def start(self):
         self.pw = await async_playwright().start()
@@ -267,8 +298,16 @@ class Browser:
             await asyncio.sleep(1.0)
             self.context = await launch_once()
         pages = self.context.pages
+        for p in pages:
+            self._attach_page_events(p)
+        try:
+            self.context.on("page", self._attach_page_events)
+        except Exception:
+            pass
         restored = [p for p in pages if p.url not in ("", "about:blank")]
         self.page = restored[-1] if restored else (pages[0] if pages else await self.context.new_page())
+        # Existing pages were attached above; a brand-new page is attached by the
+        # context "page" event handler.
         if self.page.url in ("", "about:blank"):
             try:
                 await self.page.goto(HUNYUAN_URL, wait_until="domcontentloaded", timeout=60000)
@@ -683,34 +722,67 @@ class Browser:
         await download.save_as(str(target))
         return target
 
-    async def click_xy(self, x: int, y: int, count: int = 1):
+    async def click_xy(self, x: int, y: int, count: int = 1, capture_download: bool = False):
         if not self.page:
             raise RuntimeError("Browser not started")
         before_pages = list(self.context.pages)
-        download = None
+        before_download_at = self.last_download_at
+        if capture_download:
+            self.download_event.clear()
+
+        click_error = None
         try:
-            async with self.page.expect_download(timeout=1300) as di:
-                await self.page.mouse.click(int(x), int(y), click_count=count, delay=90)
-            download = await di.value
-        except PlaywrightTimeoutError:
-            pass
-        await self.page.wait_for_timeout(550)
-        new_pages = [p for p in self.context.pages if p not in before_pages]
+            # Important: ordinary clicks are plain mouse clicks. We do NOT use
+            # page.expect_download() here. Download events are captured globally.
+            await self.page.mouse.click(int(x), int(y), click_count=count, delay=90)
+        except Exception as e:
+            click_error = e
+            # A navigation may have completed even if the old renderer died. Give
+            # Chromium a moment and recover the newest living tab before deciding.
+            if "Page crashed" not in str(e) and "Target page" not in str(e):
+                raise
+
+        await asyncio.sleep(0.55)
+        living = [p for p in self.context.pages if not p.is_closed()]
+        new_pages = [p for p in living if p not in before_pages]
         if new_pages:
             self.page = new_pages[-1]
+            self._attach_page_events(self.page)
             try:
-                await self.page.wait_for_load_state("domcontentloaded", timeout=7000)
+                await self.page.bring_to_front()
             except Exception:
                 pass
-        if download:
-            return await self.save_download(download)
+        elif self.page.is_closed() and living:
+            self.page = living[-1]
+            self._attach_page_events(self.page)
+
+        # Only download-labelled actions wait for the passive download listener.
+        if capture_download:
+            if self.last_download_at > before_download_at and self.last_download_path:
+                return self.last_download_path
+            try:
+                await asyncio.wait_for(self.download_event.wait(), timeout=12.0)
+            except asyncio.TimeoutError:
+                return None
+            if self.last_download_at > before_download_at:
+                return self.last_download_path
+
+        # For non-download actions, a renderer crash after the click is recorded as
+        # a successful attempted action when another tab survived; otherwise expose
+        # the real error so the trainer can recover visibly.
+        if click_error and not living:
+            raise click_error
         return None
 
     async def click_text(self, query: str):
         target = await self.find_text_target(query)
         if not target:
             raise RuntimeError(f"ما لكيت كتابة ظاهرة تطابق: {query}")
-        dl = await self.click_xy(int(target["x"]), int(target["y"]), 1)
+        intent = guess_intent("text_click", target, {"query": query})
+        dl = await self.click_xy(
+            int(target["x"]), int(target["y"]), 1,
+            capture_download=(intent == "download_model"),
+        )
         return target, dl
 
     async def upload_last_image(self, image_path: Path):
@@ -1553,8 +1625,16 @@ async def control_callback(update: Update, context):
             elif action in ("click", "dbl"):
                 x, y = int(st["x"]), int(st["y"])
                 el = await browser.element_at(x, y)
+                pre_intent = guess_intent(
+                    "double_click" if action == "dbl" else "click",
+                    el,
+                    {"click_count": 2 if action == "dbl" else 1},
+                )
                 async def do_click():
-                    dl = await browser.click_xy(x, y, 2 if action == "dbl" else 1)
+                    dl = await browser.click_xy(
+                        x, y, 2 if action == "dbl" else 1,
+                        capture_download=(pre_intent == "download_model"),
+                    )
                     return {"download": str(dl) if dl else None}
                 event, result = await record_action(
                     context,
@@ -1738,8 +1818,12 @@ async def text_handler(update: Update, context):
         if not target:
             await update.effective_message.reply_text(f"❌ ما لكيت النص: {text} حتى بعد البحث بكل التبويبات والإطارات. استخدم 🎮 التحكم بالموس لهذي الضغطة فقط، وهي تنحفظ بالجلسة.", reply_markup=main_menu())
             return
+        pre_intent = guess_intent("text_click", target, {"query": text})
         async def do_text_click():
-            dl = await browser.click_xy(int(target["x"]), int(target["y"]), 1)
+            dl = await browser.click_xy(
+                int(target["x"]), int(target["y"]), 1,
+                capture_download=(pre_intent == "download_model"),
+            )
             return {"download": str(dl) if dl else None}
         try:
             event, result = await record_action(
