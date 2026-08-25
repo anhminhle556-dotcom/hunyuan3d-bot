@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -113,10 +114,47 @@ class HunyuanBrowser:
             if self.pw:
                 await self.pw.stop()
 
-    async def screenshot(self, path: Path):
+    async def _fast_screenshot(self, path: Path):
+        """Take a viewport screenshot without letting Playwright font waits block training."""
         if not self.page:
             raise RuntimeError("Browser not started")
-        await self.page.screenshot(path=str(path), full_page=False)
+        first_error = None
+        try:
+            await self.page.screenshot(
+                path=str(path),
+                full_page=False,
+                timeout=8000,
+                animations="disabled",
+                caret="hide",
+            )
+            return
+        except Exception as e:
+            first_error = e
+
+        # Chromium DevTools fallback. It captures the current surface directly
+        # and does not wait for web fonts, which fixes Hunyuan screenshot stalls.
+        session = None
+        try:
+            if not self.context:
+                raise first_error or RuntimeError("No browser context")
+            session = await self.context.new_cdp_session(self.page)
+            result = await session.send("Page.captureScreenshot", {
+                "format": "png",
+                "fromSurface": True,
+                "captureBeyondViewport": False,
+            })
+            path.write_bytes(base64.b64decode(result["data"]))
+        except Exception:
+            raise first_error or RuntimeError("Screenshot failed")
+        finally:
+            if session:
+                try:
+                    await session.detach()
+                except Exception:
+                    pass
+
+    async def screenshot(self, path: Path):
+        await self._fast_screenshot(path)
 
     async def open_home(self):
         if not self.page:
@@ -673,7 +711,7 @@ class HunyuanBrowser:
         except Exception:
             pass
         try:
-            await self.page.screenshot(path=str(path), full_page=False)
+            await self._fast_screenshot(path)
         finally:
             try:
                 await self.page.evaluate("id => document.getElementById(id)?.remove()", overlay_id)
@@ -824,7 +862,7 @@ class HunyuanBrowser:
         except Exception:
             pass
         try:
-            await self.page.screenshot(path=str(path), full_page=False)
+            await self._fast_screenshot(path)
         finally:
             try:
                 await self.page.evaluate("id => document.getElementById(id)?.remove()", overlay_id)
@@ -900,6 +938,132 @@ class HunyuanBrowser:
                 before=before,
             )
             return {"element": before, "download": saved_download, "upload": used_file_chooser}
+
+    async def find_visible_text_target(self, query: str):
+        """Find the best visible text match and resolve it to a clickable target.
+
+        Exact visible text wins, then starts-with, then contains. If the text is
+        inside a span/div, the closest clickable ancestor is used.
+        """
+        assert self.page
+        query = (query or "").strip()
+        if not query:
+            return None
+        script = r"""
+        ({query}) => {
+          const q = query.replace(/\s+/g, ' ').trim().toLowerCase();
+          if (!q) return null;
+          const vw = window.innerWidth, vh = window.innerHeight;
+          const clickableSelector = 'button,a,input,textarea,select,label,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[onclick],[tabindex]';
+          function visible(el) {
+            if (!el || el.nodeType !== 1) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2 || r.bottom < 0 || r.right < 0 || r.top > vh || r.left > vw) return false;
+            const st = getComputedStyle(el);
+            return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || 1) > 0.02;
+          }
+          function norm(v) { return String(v || '').replace(/\s+/g, ' ').trim(); }
+          function cssPath(node) {
+            if (!node || node.nodeType !== 1) return '';
+            if (node.id) return '#' + CSS.escape(node.id);
+            const parts = [];
+            let cur = node;
+            for (let depth=0; cur && cur.nodeType===1 && depth<7; depth++,cur=cur.parentElement) {
+              let part = cur.tagName.toLowerCase();
+              const cls = [...cur.classList].filter(Boolean).slice(0,2);
+              if (cls.length) part += '.' + cls.map(c=>CSS.escape(c)).join('.');
+              if (cur.parentElement) {
+                const same = [...cur.parentElement.children].filter(n=>n.tagName===cur.tagName);
+                if (same.length>1) part += `:nth-of-type(${same.indexOf(cur)+1})`;
+              }
+              parts.unshift(part);
+            }
+            return parts.join(' > ');
+          }
+          function clickable(el) {
+            let c = el.closest && el.closest(clickableSelector);
+            if (c && visible(c)) return c;
+            let cur = el;
+            for (let i=0; cur && i<6; i++, cur=cur.parentElement) {
+              try {
+                const st = getComputedStyle(cur);
+                if (st.cursor === 'pointer' || typeof cur.onclick === 'function') {
+                  if (visible(cur)) return cur;
+                }
+              } catch (_) {}
+            }
+            return el;
+          }
+          const candidates = [];
+          const all = [...document.querySelectorAll('body *')];
+          for (const el of all) {
+            if (!visible(el)) continue;
+            const vals = [
+              norm(el.innerText), norm(el.textContent), norm(el.getAttribute('aria-label')),
+              norm(el.getAttribute('title')), norm(el.getAttribute('placeholder')),
+              norm(el.getAttribute('value'))
+            ].filter(Boolean);
+            if (!vals.length) continue;
+            let matchScore = Infinity, matched = '';
+            for (const raw of vals) {
+              const v = raw.toLowerCase();
+              let score = Infinity;
+              if (v === q) score = 0;
+              else if (v.startsWith(q)) score = 100 + Math.max(0, v.length-q.length);
+              else if (v.includes(q)) score = 300 + Math.max(0, v.length-q.length);
+              if (score < matchScore) { matchScore = score; matched = raw; }
+            }
+            if (!Number.isFinite(matchScore)) continue;
+            const target = clickable(el);
+            if (!visible(target)) continue;
+            const r = target.getBoundingClientRect();
+            const isClickable = target !== el || target.matches(clickableSelector) || getComputedStyle(target).cursor === 'pointer';
+            const areaPenalty = Math.min(500, (r.width*r.height) / 5000);
+            const score = matchScore + (isClickable ? 0 : 80) + areaPenalty;
+            candidates.push({el, target, matched, score});
+          }
+          candidates.sort((a,b)=>a.score-b.score);
+          if (!candidates.length) return null;
+          const best = candidates[0];
+          const el = best.target;
+          const r = el.getBoundingClientRect();
+          const attrs = {};
+          for (const name of ['id','class','role','aria-label','name','type','href','title','placeholder','data-testid','data-test','data-cy']) {
+            const v = el.getAttribute && el.getAttribute(name);
+            if (v) attrs[name] = String(v).slice(0,300);
+          }
+          return {
+            n: 0,
+            kind: 'text-search',
+            x: Math.round(r.x + r.width/2),
+            y: Math.round(r.y + r.height/2),
+            bbox: {x:r.x,y:r.y,width:r.width,height:r.height},
+            tag: el.tagName.toLowerCase(),
+            text: norm(el.innerText || el.textContent || best.matched).slice(0,300),
+            matched_text: best.matched.slice(0,300),
+            attrs,
+            selector: cssPath(el),
+            score: best.score,
+          };
+        }
+        """
+        try:
+            return await self.page.evaluate(script, {"query": query})
+        except Exception:
+            return None
+
+    async def click_visible_text(self, query: str, image_path: Optional[Path] = None):
+        target = await self.find_visible_text_target(query)
+        if not target:
+            raise RuntimeError(f"ما لكيت كتابة ظاهرة تطابق: {query}")
+        result = await self.click_number_target(target, image_path=image_path)
+        await self.log_training_action(
+            "text_search_click",
+            int(target.get("x") or 0),
+            int(target.get("y") or 0),
+            {"query": query, "target": target, "upload": bool(result.get("upload")), "download": str(result.get("download")) if result.get("download") else None},
+        )
+        return target, result
 
     async def manual_move(self, state: dict, dx: int, dy: int):
         vp = await self._viewport()
@@ -1042,7 +1206,7 @@ async def get_browser(context: ContextTypes.DEFAULT_TYPE) -> HunyuanBrowser:
 
 def _main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔢 شبكة الأرقام الذكية", callback_data="menu:numsmart")],
+        [InlineKeyboardButton("🔢 شبكة الأرقام الذكية", callback_data="menu:numsmart"), InlineKeyboardButton("🔎 بحث بالنص والضغط", callback_data="menu:textclick")],
         [InlineKeyboardButton("🧩 شبكة الشاشة 1-60", callback_data="menu:numgrid"), InlineKeyboardButton("📸 لقطة الشاشة", callback_data="menu:shot")],
         [InlineKeyboardButton("🧪 وضع تدريب", callback_data="menu:manual"), InlineKeyboardButton("🤖 وضع تلقائي", callback_data="menu:auto")],
         [InlineKeyboardButton("📊 حالة البوت", callback_data="menu:status"), InlineKeyboardButton("🏠 فتح Hunyuan", callback_data="menu:open")],
@@ -1063,7 +1227,7 @@ async def _send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             "🤖 بوت Hunyuan 3D — وضع التدريب\n\n"
             "ما تحتاج تحرك موس ولا تحفظ أوامر.\n"
             "اضغط 🔢 شبكة الأرقام الذكية، راح أرقّم كل زر/عنصر قابل للضغط على الشاشة.\n"
-            "بعدها اكتب رقم العنصر فقط وأنا أضغطه وأسجل الخطوة. للأماكن غير القابلة للكشف استخدم 🧩 شبكة الشاشة 1-60."
+            "بعدها اكتب رقم العنصر فقط وأنا أضغطه وأسجل الخطوة. أو اضغط 🔎 بحث بالنص والضغط واكتب أي كلمة ظاهرة مثل 立即生成، وأنا أضغطها مباشرة. للأماكن غير القابلة للكشف استخدم 🧩 شبكة الشاشة 1-60."
         ),
         reply_markup=_main_menu_keyboard(),
     )
@@ -1161,6 +1325,7 @@ def _number_keyboard(kind: str):
     other = "grid" if kind == "smart" else "smart"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 تحديث الأرقام", callback_data=f"num:{kind}:refresh"), InlineKeyboardButton("🔁 تبديل الشبكة", callback_data=f"num:{other}:refresh")],
+        [InlineKeyboardButton("🔎 بحث بالنص والضغط", callback_data="menu:textclick")],
         [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="num:upload"), InlineKeyboardButton("📦 إرسال الجلسة", callback_data="menu:session")],
         [InlineKeyboardButton("⬅️ رجوع", callback_data="num:back"), InlineKeyboardButton("↻ تحديث الصفحة", callback_data="num:reload"), InlineKeyboardButton("🏠 القائمة", callback_data="menu:main")],
     ])
@@ -1521,6 +1686,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "clearlog":
         await _clear_training_session(context)
         await q.message.reply_text("🧹 بدأت جلسة تدريب جديدة ومسحت السجل واللقطات القديمة.", reply_markup=_main_menu_keyboard())
+    elif action == "textclick":
+        context.user_data["awaiting_trainer_text"] = "click_text"
+        await q.message.reply_text(
+            "🔎 أرسل أي كتابة ظاهرة حالياً على صفحة Hunyuan.\n"
+            "مثال: 立即生成 أو 图/文生3D أو 下载\n\n"
+            "راح أبحث عنها، أختار أفضل تطابق ظاهر، أضغطه وأسجل العنصر بالجلسة."
+        )
     elif action == "type":
         context.user_data["awaiting_trainer_text"] = "type"
         await q.message.reply_text("⌨️ أرسل النص هسه، وأنا أكتبه بمكان المؤشر الحالي.")
@@ -1593,18 +1765,25 @@ async def trainer_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         image_path = Path(last) if last and Path(last).exists() else None
         try:
             result = await browser.click_number_target(target, image_path=image_path)
-            note_parts = [f"✅ ضغطت الرقم {n}"]
-            label = ((target.get("text") or "").strip() or target.get("selector") or "")[:120]
-            if label: note_parts.append(f"العنصر: {label}")
-            if result.get("upload"): note_parts.append("📎 وتم تمرير آخر صورة إلى اختيار الملف")
-            if result.get("download"):
-                dl = Path(result["download"])
-                with dl.open("rb") as f:
-                    await update.effective_message.reply_document(f, filename=dl.name, caption="📦 التقطت ملف التنزيل أثناء التدريب.")
-            await _render_number_grid(update, context, number_state.get("kind", "smart"), note=" | ".join(note_parts))
         except Exception as e:
             log.exception("Number click failed")
             await update.effective_message.reply_text(f"❌ فشل ضغط الرقم {n}: {e}")
+            return
+
+        note_parts = [f"✅ ضغطت الرقم {n}"]
+        label = ((target.get("text") or "").strip() or target.get("selector") or "")[:120]
+        if label: note_parts.append(f"العنصر: {label}")
+        if result.get("upload"): note_parts.append("📎 وتم تمرير آخر صورة إلى اختيار الملف")
+        await update.effective_message.reply_text(" | ".join(note_parts))
+        if result.get("download"):
+            dl = Path(result["download"])
+            with dl.open("rb") as f:
+                await update.effective_message.reply_document(f, filename=dl.name, caption="📦 التقطت ملف التنزيل أثناء التدريب.")
+        try:
+            await _render_number_grid(update, context, number_state.get("kind", "smart"), note=" | ".join(note_parts))
+        except Exception as e:
+            log.warning("Post number-click grid refresh failed: %s", e)
+            await update.effective_message.reply_text("✅ الضغط تم بنجاح، بس لقطة تحديث الأرقام تأخرت. اضغط «🔄 تحديث الأرقام» وما تعيد نفس الرقم.")
         return
 
     mode = context.user_data.pop("awaiting_trainer_text", None)
@@ -1616,7 +1795,38 @@ async def trainer_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     browser = await get_browser(context)
     st = _manual_state(context)
-    if mode == "type":
+    if mode == "click_text":
+        last = context.application.bot_data.get("last_manual_image")
+        image_path = Path(last) if last and Path(last).exists() else None
+        try:
+            target, result = await browser.click_visible_text(text, image_path=image_path)
+            matched = (target.get("matched_text") or target.get("text") or text)[:180]
+            await update.effective_message.reply_text(
+                f"✅ لكيت وضغطت النص: {matched}\n"
+                f"🎯 العنصر: {(target.get('tag') or '')} | {(target.get('selector') or '')[:220]}",
+                reply_markup=_main_menu_keyboard(),
+            )
+            if result.get("upload"):
+                await update.effective_message.reply_text("📎 وتم تمرير آخر صورة إلى حقل الرفع.")
+            if result.get("download"):
+                dl = Path(result["download"])
+                with dl.open("rb") as f:
+                    await update.effective_message.reply_document(f, filename=dl.name, caption="📦 التقطت ملف التنزيل أثناء التدريب.")
+            # Refresh the numbered view if possible, but never report a successful
+            # click as failed only because Hunyuan stalled while taking a screenshot.
+            try:
+                await _render_number_grid(update, context, "smart", note=f"🔎 ضغط بالنص: {matched}")
+            except Exception as refresh_error:
+                log.warning("Post text-click grid refresh failed: %s", refresh_error)
+                await update.effective_message.reply_text("✅ الضغط تم. تحديث لقطة الأرقام تأخر؛ اضغط «🔄 تحديث الأرقام» إذا تحتاج صورة جديدة.")
+        except Exception as e:
+            log.exception("Text search click failed")
+            await update.effective_message.reply_text(
+                f"❌ ما قدرت أضغط النص «{text}»: {e}\n"
+                "جرّب جزء مميز من الكتابة، أو استخدم شبكة الأرقام.",
+                reply_markup=_main_menu_keyboard(),
+            )
+    elif mode == "type":
         await browser.manual_type(st, text)
         await update.effective_message.reply_text("⌨️ تمّت الكتابة وسجلت الخطوة.", reply_markup=_main_menu_keyboard())
     elif mode == "mark":
