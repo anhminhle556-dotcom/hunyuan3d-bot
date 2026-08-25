@@ -813,26 +813,37 @@ async def get_browser(context: ContextTypes.DEFAULT_TYPE) -> HunyuanBrowser:
     return context.application.bot_data["hunyuan_browser"]
 
 
+def _main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖱 التحكم بالموس", callback_data="menu:control"), InlineKeyboardButton("📸 لقطة الشاشة", callback_data="menu:shot")],
+        [InlineKeyboardButton("🧪 وضع يدوي", callback_data="menu:manual"), InlineKeyboardButton("🤖 وضع تلقائي", callback_data="menu:auto")],
+        [InlineKeyboardButton("📊 حالة البوت", callback_data="menu:status"), InlineKeyboardButton("🏠 فتح Hunyuan", callback_data="menu:open")],
+        [InlineKeyboardButton("🔐 شاشة تسجيل الدخول", callback_data="menu:login"), InlineKeyboardButton("📤 إرسال سجل التدريب", callback_data="menu:exportlog")],
+        [InlineKeyboardButton("⌨️ كتابة نص", callback_data="menu:type"), InlineKeyboardButton("🏷 حفظ خطوة", callback_data="menu:mark")],
+        [InlineKeyboardButton("🧹 مسح سجل التدريب", callback_data="menu:clearlog")],
+    ])
+
+
+async def _send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
+    msg = update.effective_message
+    if not msg and update.callback_query:
+        msg = update.callback_query.message
+    if not msg:
+        return
+    await msg.reply_text(
+        text or (
+            "🤖 بوت Hunyuan 3D — وضع التدريب\n\n"
+            "ما تحتاج تحفظ أوامر. استخدم الأزرار تحت.\n"
+            "أرسل صورة للبوت، بعدها افتح 🖱 التحكم بالموس وارفعها من زر 📎 رفع آخر صورة."
+        ),
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
 @owner_only
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🤖 بوت Hunyuan 3D — بدون API\n\n"
-        "هسه الوضع الافتراضي تدريب يدوي حتى نعلّم البوت الواجهة الحقيقية بدون تخمين.\n"
-        "أرسل صورة، وبعدها استخدم /control للتحكم بالماوس من تيليجرام.\n\n"
-        "الأوامر:\n"
-        "/control — شبكة موس وتحكم يدوي من تيليجرام\n"
-        "/manual — وضع التدريب اليدوي (الافتراضي)\n"
-        "/auto — تشغيل الأتمتة القديمة بعد ما نخلص التدريب\n"
-        "/type نص — كتابة النص بالمكان الحالي للمؤشر\n"
-        "/mark اسم — حفظ خطوة مهمة مع معلومات العنصر\n"
-        "/exportlog — إرسال سجل كل الضغطات للتدريب\n"
-        "/clearlog — مسح سجل التدريب والبدء من جديد\n"
-        "/login — رابط المتصفح لتسجيل الدخول\n"
-        "/shot — لقطة شاشة لحالة الموقع\n"
-        "/open — إعادة فتح Hunyuan\n"
-        "/status — حالة البوت"
-    )
-    await update.effective_message.reply_text(text)
+    context.application.bot_data["manual_mode"] = True
+    await _send_main_menu(update, context)
 
 
 @owner_only
@@ -926,6 +937,7 @@ def _control_keyboard(step: int):
         [InlineKeyboardButton("⇧ سكرول", callback_data="ctl:su"), InlineKeyboardButton("⇩ سكرول", callback_data="ctl:sd"), InlineKeyboardButton("🔄 صورة", callback_data="ctl:refresh")],
         [InlineKeyboardButton("⬅️ رجوع", callback_data="ctl:back"), InlineKeyboardButton("↻ تحديث", callback_data="ctl:reload"), InlineKeyboardButton("🏠 Hunyuan", callback_data="ctl:home")],
         [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="ctl:upload"), InlineKeyboardButton("↵ Enter", callback_data="ctl:enter"), InlineKeyboardButton("Esc", callback_data="ctl:esc")],
+        [InlineKeyboardButton("⌨️ كتابة", callback_data="ctl:type"), InlineKeyboardButton("🏷 حفظ خطوة", callback_data="ctl:mark"), InlineKeyboardButton("🏠 القائمة", callback_data="ctl:menu")],
     ])
 
 
@@ -1099,12 +1111,92 @@ async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await browser.manual_upload_file(st, Path(last))
                 note = "📎 رفعت آخر صورة وسجلت input المستخدم."
+        elif action == "type":
+            context.user_data["awaiting_trainer_text"] = "type"
+            await q.message.reply_text("⌨️ أرسل النص هسه، وأنا أكتبه بمكان المؤشر الحالي.")
+            return
+        elif action == "mark":
+            context.user_data["awaiting_trainer_text"] = "mark"
+            await q.message.reply_text("🏷 أرسل اسم الخطوة، مثال: generate_button")
+            return
+        elif action == "menu":
+            await _send_main_menu(update, context, "🏠 القائمة الرئيسية")
+            return
         elif action == "refresh":
             pass
     except Exception as e:
         log.exception("Manual control action failed")
         note = f"❌ {e}"
     await _render_control(update, context, query=q, note=note)
+
+
+@owner_only
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    action = (q.data or "").split(":", 1)[-1]
+
+    if action == "main":
+        await _send_main_menu(update, context, "🏠 القائمة الرئيسية")
+    elif action == "control":
+        context.application.bot_data["manual_mode"] = True
+        await _render_control(update, context, query=q)
+    elif action == "manual":
+        context.application.bot_data["manual_mode"] = True
+        await q.message.reply_text("🧪 تم تفعيل الوضع اليدوي. الصور تنخزن فقط وماكو ضغط تلقائي.", reply_markup=_main_menu_keyboard())
+    elif action == "auto":
+        browser = await get_browser(context)
+        if browser.lock.locked():
+            await q.message.reply_text("🟠 أكو عملية حالياً؛ ما أبدل الوضع وهي شغالة.", reply_markup=_main_menu_keyboard())
+        else:
+            context.application.bot_data["manual_mode"] = False
+            await q.message.reply_text("🤖 تم تفعيل الوضع التلقائي الحالي.", reply_markup=_main_menu_keyboard())
+    elif action == "status":
+        await status_cmd(update, context)
+    elif action == "shot":
+        await shot_cmd(update, context)
+    elif action == "open":
+        await open_cmd(update, context)
+    elif action == "login":
+        await login_cmd(update, context)
+    elif action == "exportlog":
+        await exportlog_cmd(update, context)
+    elif action == "clearlog":
+        TRAIN_LOG.unlink(missing_ok=True)
+        await q.message.reply_text("🧹 مسحت سجل التدريب القديم.", reply_markup=_main_menu_keyboard())
+    elif action == "type":
+        context.user_data["awaiting_trainer_text"] = "type"
+        await q.message.reply_text("⌨️ أرسل النص هسه، وأنا أكتبه بمكان المؤشر الحالي.")
+    elif action == "mark":
+        context.user_data["awaiting_trainer_text"] = "mark"
+        await q.message.reply_text("🏷 أرسل اسم الخطوة، مثال: generate_button")
+
+
+@owner_only
+async def trainer_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.pop("awaiting_trainer_text", None)
+    if not mode:
+        return
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        await update.effective_message.reply_text("⚠️ أرسل نص غير فارغ.", reply_markup=_main_menu_keyboard())
+        return
+    browser = await get_browser(context)
+    st = _manual_state(context)
+    if mode == "type":
+        await browser.manual_type(st, text)
+        await update.effective_message.reply_text("⌨️ تمّت الكتابة وسجلت الخطوة.", reply_markup=_main_menu_keyboard())
+        await _render_control(update, context)
+    elif mode == "mark":
+        path, elem = await browser.mark_training(st, text)
+        txt = json.dumps(elem, ensure_ascii=False, indent=2)[:2200]
+        try:
+            with path.open("rb") as f:
+                await update.effective_message.reply_photo(f, caption=f"🏷 Mark: {text}\n{txt}", reply_markup=_main_menu_keyboard())
+        finally:
+            path.unlink(missing_ok=True)
 
 
 async def _download_telegram_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Path]:
@@ -1141,7 +1233,11 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.application.bot_data["last_manual_image"] = str(image_path)
         await msg.reply_text(
             "🧪 خزنت الصورة للتدريب وما ضغطت أي شي بالموقع.\n"
-            "افتح /control وحرّك المؤشر، وبعدها اضغط 📎 رفع آخر صورة من شبكة الموس."
+            "اضغط 🖱 التحكم بالموس، وبعدها 📎 رفع آخر صورة.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🖱 التحكم بالموس", callback_data="menu:control")],
+                [InlineKeyboardButton("📸 لقطة الشاشة", callback_data="menu:shot"), InlineKeyboardButton("🏠 القائمة", callback_data="menu:main")],
+            ]),
         )
         return
     if browser.lock.locked():
@@ -1241,7 +1337,9 @@ def main():
     app.add_handler(CommandHandler("shot", shot_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CallbackQueryHandler(control_callback, pattern=r"^ctl:"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, trainer_text_handler))
     app.run_polling(drop_pending_updates=True)
 
 
