@@ -40,6 +40,9 @@ WATCH_SCREENSHOT_EVERY_SEC = int(os.environ.get("WATCH_SCREENSHOT_EVERY_SEC", "3
 # This is the safety net that keeps recording even when the WebGL page is busy.
 GEN_FRAME_EVERY_SEC = int(os.environ.get("GEN_FRAME_EVERY_SEC", "10"))
 WATCH_MAX_MIN = int(os.environ.get("WATCH_MAX_MIN", "30"))
+TIMELINE_FRAME_EVERY_SEC = int(os.environ.get("TIMELINE_FRAME_EVERY_SEC", "10"))
+TIMELINE_DIR = SHOTS_DIR / "timeline"
+TIMELINE_FILE = SESSION_DIR / "timeline_frames.jsonl"
 
 for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, SESSION_DIR, SHOTS_DIR):
     p.mkdir(parents=True, exist_ok=True)
@@ -257,30 +260,51 @@ class Browser:
         raise RuntimeError("Screenshot failed | "+" | ".join(errors[-3:]))
 
     async def x11_screenshot(self, path: Path):
-        """Capture the X11 display directly, without touching Playwright or the page DOM.
+        """Capture the visible X11 display without touching Chromium DOM/Playwright.
 
-        This is intentionally used during Hunyuan generation because WebGL can make
-        page.evaluate/page.screenshot slow or temporarily unresponsive while Xvfb is
-        still rendering the visible browser window normally.
+        This path is used for training screenshots and timeline frames, including while
+        Hunyuan WebGL is loading. scrot is first choice; ffmpeg x11grab is a fallback.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not shutil.which("scrot"):
-            raise RuntimeError("scrot is not installed")
-        proc = await asyncio.create_subprocess_exec(
-            "scrot", "-o", str(path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":99")},
-        )
-        try:
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=4.0)
-        except asyncio.TimeoutError:
-            try: proc.kill()
-            except Exception: pass
-            raise RuntimeError("X11 screenshot timed out")
-        if proc.returncode != 0 or not path.exists() or path.stat().st_size < 1000:
-            raise RuntimeError("X11 screenshot failed: " + (err or b"").decode("utf-8", "ignore")[-500:])
-        return path
+        display = os.environ.get("DISPLAY", ":99")
+        errors = []
+
+        if shutil.which("scrot"):
+            proc = await asyncio.create_subprocess_exec(
+                "scrot", "-o", "-p", str(path),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "DISPLAY": display},
+            )
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=4.0)
+                if proc.returncode == 0 and path.exists() and path.stat().st_size > 1000:
+                    return path
+                errors.append("scrot:" + (err or b"").decode("utf-8", "ignore")[-300:])
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except Exception: pass
+                errors.append("scrot:timeout")
+
+        if shutil.which("ffmpeg"):
+            # Xvfb is started at 1365x768 in start.sh. ffmpeg captures one frame directly.
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-loglevel", "error", "-y",
+                "-f", "x11grab", "-video_size", "1365x768", "-i", display,
+                "-frames:v", "1", str(path),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "DISPLAY": display},
+            )
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=6.0)
+                if proc.returncode == 0 and path.exists() and path.stat().st_size > 1000:
+                    return path
+                errors.append("ffmpeg:" + (err or b"").decode("utf-8", "ignore")[-300:])
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except Exception: pass
+                errors.append("ffmpeg:timeout")
+
+        raise RuntimeError("X11 screenshot failed | " + " | ".join(errors[-3:]))
 
     async def screenshot_cursor(self, path: Path, x: int, y: int):
         if not self.page:
@@ -532,13 +556,26 @@ def manual_state(context):
     return st
 
 
+async def safe_page_info(browser: Browser):
+    """Best-effort page metadata that can never block X11 screenshot recording."""
+    try:
+        return await asyncio.wait_for(browser.page_info(), timeout=2.0)
+    except Exception as e:
+        try:
+            url = browser.page.url if browser.page else ""
+        except Exception:
+            url = ""
+        return {"url": url, "title": "", "viewport": {"w": 1365, "h": 768}, "error": str(e)}
+
+
 async def capture_session_screenshot(browser: Browser, seq: int, action: str, phase: str, state: dict):
+    """Session screenshots are X11-native, so WebGL/DOM cannot block them."""
     path = SHOTS_DIR / f"{seq:04d}_{safe_slug(action)}_{phase}.png"
     try:
-        await browser.screenshot_cursor(path, int(state["x"]), int(state["y"]))
+        await browser.x11_screenshot(path)
         return path
     except Exception as e:
-        log.warning("Session screenshot failed: %s", e)
+        log.warning("Session X11 screenshot failed: %s", e)
         return None
 
 
@@ -548,7 +585,7 @@ async def record_action(context, action: str, perform, *, element=None, extra=No
     meta = ensure_session()
     now = time.time()
     seq = int(meta.get("event_count", 0)) + 1
-    before_info = await browser.page_info()
+    before_info = await safe_page_info(browser)
     if element is None and action in ("click", "double_click", "type_text", "key"):
         element = await browser.element_at(int(st["x"]), int(st["y"]))
     before_path = None
@@ -563,7 +600,7 @@ async def record_action(context, action: str, perform, *, element=None, extra=No
         error = f"{type(e).__name__}: {e}"
 
     await asyncio.sleep(0.35)
-    after_info = await browser.page_info()
+    after_info = await safe_page_info(browser)
     after_path = None
     if screenshot:
         after_path = await capture_session_screenshot(browser, seq, action, "after", st)
@@ -612,6 +649,78 @@ async def record_observation(context, action="snapshot", extra=None):
     async def noop():
         return None
     return await record_action(context, action, noop, extra=extra or {}, screenshot=True, meaningful=False)
+
+
+def append_timeline_frame(row: dict):
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    TIMELINE_DIR.mkdir(parents=True, exist_ok=True)
+    with TIMELINE_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+async def session_timeline_loop(application):
+    """Always-on X11 recorder for the whole training session.
+
+    Crucially, it does NOT wait for Generate detection. It starts with the bot and
+    continues every N seconds through uploads, queues, WebGL loading, and download UI.
+    """
+    browser = application.bot_data["browser"]
+    frame_no = 0
+    while not application.bot_data.get("timeline_stop"):
+        frame_no += 1
+        meta = ensure_session()
+        now = time.time()
+        stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path = TIMELINE_DIR / f"timeline_{frame_no:05d}_{stamp}_{int((now%1)*1000):03d}.png"
+        rel = None
+        error = None
+        try:
+            await browser.x11_screenshot(path)
+            rel = str(path.relative_to(SESSION_DIR))
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            log.warning("Timeline X11 screenshot failed: %s", e)
+        try:
+            url = browser.page.url if browser.page else ""
+        except Exception:
+            url = ""
+        append_timeline_frame({
+            "frame": frame_no,
+            "captured_at": now,
+            "captured_at_utc": iso_utc(now),
+            "elapsed_from_session_sec": round(now - float(meta.get("started_at", now)), 3),
+            "screenshot": rel,
+            "url": url,
+            "error": error,
+            "source": "always_on_x11_timeline",
+        })
+        try:
+            await asyncio.sleep(max(3, TIMELINE_FRAME_EVERY_SEC))
+        except asyncio.CancelledError:
+            break
+
+
+def start_timeline_recorder(application):
+    task = application.bot_data.get("timeline_task")
+    if task and not task.done():
+        return False
+    application.bot_data["timeline_stop"] = False
+    application.bot_data["timeline_task"] = application.create_task(session_timeline_loop(application))
+    return True
+
+
+async def restart_timeline_recorder(application):
+    application.bot_data["timeline_stop"] = True
+    task = application.bot_data.get("timeline_task")
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+    application.bot_data["timeline_task"] = None
+    application.bot_data["timeline_stop"] = False
+    start_timeline_recorder(application)
 
 
 GEN_FRAMES_FILE = SESSION_DIR / "generation_frames.jsonl"
@@ -672,7 +781,7 @@ async def record_watch_observation(application, state: dict, *, screenshot=True)
     browser=application.bot_data["browser"]
     st=application.bot_data.setdefault("manual_state", {"x":680,"y":380,"step":15})
     meta=ensure_session(); now=time.time(); seq=int(meta.get("event_count",0))+1
-    page_info=await browser.page_info(); shot=None
+    page_info=await safe_page_info(browser); shot=None
     if screenshot:
         shot=await capture_session_screenshot(browser, seq, "generation_watch", "after", st)
     ended=time.time()
@@ -942,7 +1051,7 @@ async def export_session(update: Update, context):
         "events.jsonl: full machine-readable timeline.\n"
         "workflow.json: compact ordered workflow with observed waits.\n"
         "replay_plan.py: code-like Playwright replay plan generated from the actions.\n"
-        "screens/: before/after screenshots for real page actions.\ngeneration_frames.jsonl + screens/generation_frames/: hard X11 screenshots recorded during 3D generation.\n"
+        "screens/: before/after X11 screenshots for real page actions.\ntimeline_frames.jsonl + screens/timeline/: ALWAYS-ON X11 screenshots for the entire session, including loading screens.\ngeneration_frames.jsonl + screens/generation_frames/: generation-specific X11 screenshots when Generate was detected.\n"
         "summary.json: session metadata.\n\n"
         "Security: browser cookies, passwords and the Chrome profile are NOT exported.\n"
     )
@@ -963,25 +1072,39 @@ async def export_session(update: Update, context):
             caption=(
                 f"📦 جلسة التدريب محفوظة\n"
                 f"الخطوات: {len(workflow)}\n"
-                "بيها الوقت بين الخطوات + العنصر اللي ضغطته + before/after screenshots + replay_plan.py.\n"
+                "بيها الوقت بين الخطوات + العنصر اللي ضغطته + before/after screenshots + لقطات timeline المستمرة + replay_plan.py.\n"
                 "دز هذا الـZIP إلي حتى أبني الأتمتة النهائية."
             ),
         )
 
 
 async def clear_session(update: Update, context):
+    # Stop the recorder before deleting its current output directory.
+    context.application.bot_data["timeline_stop"] = True
+    task = context.application.bot_data.get("timeline_task")
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+    context.application.bot_data["timeline_task"] = None
     if SESSION_DIR.exists():
         shutil.rmtree(SESSION_DIR)
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     SHOTS_DIR.mkdir(parents=True, exist_ok=True)
     ensure_session()
-    await update.effective_message.reply_text("🧹 بدأت جلسة تدريب جديدة. من هسه كل ضغطة حقيقية تنحفظ ويا وقتها ولقطاتها.")
+    context.application.bot_data["timeline_stop"] = False
+    start_timeline_recorder(context.application)
+    await update.effective_message.reply_text(
+        f"🧹 بدأت جلسة تدريب جديدة.\n📸 تسجيل X11 شغال تلقائياً كل {TIMELINE_FRAME_EVERY_SEC}ث من هسه، حتى أثناء شاشة التحميل."
+    )
 
 
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 التحكم بالموس", callback_data="menu:control"), InlineKeyboardButton("🔎 اضغط كتابة", callback_data="menu:textclick")],
-        [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="menu:upload"), InlineKeyboardButton("📸 لقطة + حفظ الوقت", callback_data="menu:snapshot")],
+        [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="menu:upload"), InlineKeyboardButton("📸 لقطة X11 الآن", callback_data="menu:snapshot")],
         [InlineKeyboardButton("⏳ متابعة التوليد", callback_data="menu:watchstart"), InlineKeyboardButton("🛑 إيقاف المتابعة", callback_data="menu:watchstop")],
         [InlineKeyboardButton("📦 حفظ وإرسال الجلسة", callback_data="menu:session")],
         [InlineKeyboardButton("🧹 جلسة جديدة", callback_data="menu:newsession"), InlineKeyboardButton("📊 الحالة", callback_data="menu:status")],
@@ -1132,7 +1255,8 @@ async def status_cmd(update: Update, context):
         f"🧾 الخطوات المهمة: {meta.get('meaningful_count',0)}\n"
         f"⏱ مدة الجلسة: {elapsed/60:.1f} دقيقة\n"
         f"⏳ منذ آخر خطوة مهمة: {wait:.1f} ثانية\n"
-        f"👁 متابعة التوليد: {watch}\n"
+        f"👁 متابعة التوليد: {watch}\n"        f"📸 تسجيل الجلسة المستمر: {'شغال ✅' if context.application.bot_data.get('timeline_task') and not context.application.bot_data.get('timeline_task').done() else 'متوقف ❌'} | كل {TIMELINE_FRAME_EVERY_SEC}ث\n"
+
         f"🌐 {browser.page.url if browser.page else ''}",
         reply_markup=main_menu(),
     )
@@ -1454,8 +1578,11 @@ async def post_init(app: Application):
     app.bot_data["generation_watch_task"] = None
     app.bot_data["generation_frame_task"] = None
     app.bot_data["generation_watch_stop"] = False
+    app.bot_data["timeline_task"] = None
+    app.bot_data["timeline_stop"] = False
     ensure_session()
-    log.info("Trainer started | noVNC=%s", novnc_url())
+    start_timeline_recorder(app)
+    log.info("Trainer started | noVNC=%s | timeline every %ss", novnc_url(), TIMELINE_FRAME_EVERY_SEC)
 
 
 async def post_shutdown(app: Application):
@@ -1464,6 +1591,12 @@ async def post_shutdown(app: Application):
     if task and not task.done():
         task.cancel()
         try: await task
+        except BaseException: pass
+    app.bot_data["timeline_stop"] = True
+    ttask = app.bot_data.get("timeline_task")
+    if ttask and not ttask.done():
+        ttask.cancel()
+        try: await ttask
         except BaseException: pass
     browser = app.bot_data.get("browser")
     if browser:
