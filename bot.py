@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -39,8 +40,12 @@ MANUAL_DEFAULT = os.environ.get("MANUAL_DEFAULT", "1").strip().lower() not in ("
 TRAIN_DIR = DATA_DIR / "training"
 TRAIN_LOG = TRAIN_DIR / "actions.jsonl"
 MARKS_DIR = TRAIN_DIR / "marks"
+SESSION_DIR = TRAIN_DIR / "number-session"
+SESSION_SHOTS_DIR = SESSION_DIR / "screens"
+SESSION_TARGETS = SESSION_DIR / "latest-targets.json"
+SESSION_META = SESSION_DIR / "session-meta.json"
 
-for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, MARKS_DIR):
+for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, MARKS_DIR, SESSION_DIR, SESSION_SHOTS_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -71,6 +76,7 @@ class HunyuanBrowser:
         self.context = None
         self.page: Optional[Page] = None
         self.lock = asyncio.Lock()
+        self.control_lock = asyncio.Lock()
 
     async def start(self):
         self.pw = await async_playwright().start()
@@ -674,6 +680,227 @@ class HunyuanBrowser:
             except Exception:
                 pass
 
+    async def numbered_targets(self, kind: str = "smart", max_items: int = 90):
+        """Return numbered click targets for the current viewport.
+
+        smart: visible interactive DOM elements, best for tiny buttons.
+        grid: fixed 10x6 screen cells as a fallback for canvas/non-semantic UI.
+        """
+        assert self.page
+        vp = await self._viewport()
+        if kind == "grid":
+            cols, rows = 10, 6
+            items = []
+            cw, ch = vp["w"] / cols, vp["h"] / rows
+            n = 1
+            for r in range(rows):
+                for c in range(cols):
+                    x0, y0 = c * cw, r * ch
+                    items.append({
+                        "n": n,
+                        "kind": "grid",
+                        "x": int(x0 + cw / 2),
+                        "y": int(y0 + ch / 2),
+                        "bbox": {"x": x0, "y": y0, "width": cw, "height": ch},
+                        "tag": "grid-cell",
+                        "text": f"screen-cell-{n}",
+                        "attrs": {},
+                        "selector": "",
+                    })
+                    n += 1
+            return items
+
+        script = r"""
+        ({maxItems}) => {
+          const vw = window.innerWidth, vh = window.innerHeight;
+          const selectors = 'button,a,input,textarea,select,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[onclick],[tabindex]';
+          const base = [...document.querySelectorAll(selectors)];
+          // Hunyuan uses clickable divs in several places. Add pointer-cursor nodes too.
+          for (const el of document.querySelectorAll('div,span,label,img,svg')) {
+            try { if (getComputedStyle(el).cursor === 'pointer') base.push(el); } catch (_) {}
+          }
+          const uniq = [...new Set(base)];
+          const raw = [];
+          function cssPath(node) {
+            if (!node || node.nodeType !== 1) return '';
+            if (node.id) return '#' + CSS.escape(node.id);
+            const parts = [];
+            let cur = node;
+            for (let depth=0; cur && cur.nodeType===1 && depth<6; depth++,cur=cur.parentElement) {
+              let part = cur.tagName.toLowerCase();
+              const cls = [...cur.classList].filter(Boolean).slice(0,2);
+              if (cls.length) part += '.' + cls.map(c=>CSS.escape(c)).join('.');
+              if (cur.parentElement) {
+                const same = [...cur.parentElement.children].filter(n=>n.tagName===cur.tagName);
+                if (same.length>1) part += `:nth-of-type(${same.indexOf(cur)+1})`;
+              }
+              parts.unshift(part);
+              if (cur.id) break;
+            }
+            return parts.join(' > ');
+          }
+          function score(el, r) {
+            const tag = el.tagName.toLowerCase();
+            let s = 50;
+            if (tag === 'button') s -= 20;
+            if (tag === 'input') s -= 15;
+            if ((el.getAttribute('role')||'').match(/button|tab|menuitem|link/i)) s -= 15;
+            if ((el.innerText||el.textContent||'').trim()) s -= 5;
+            // Prefer smaller concrete controls over giant clickable cards.
+            s += Math.min(30, (r.width*r.height)/(vw*vh)*100);
+            return s;
+          }
+          for (const el of uniq) {
+            let r; try { r = el.getBoundingClientRect(); } catch (_) { continue; }
+            if (!r || r.width < 8 || r.height < 8) continue;
+            if (r.bottom <= 0 || r.right <= 0 || r.left >= vw || r.top >= vh) continue;
+            let st; try { st = getComputedStyle(el); } catch (_) { continue; }
+            if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity||1) < 0.05) continue;
+            if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+            const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g,' ').trim().slice(0,160);
+            const attrs = {};
+            for (const name of ['id','class','role','aria-label','name','type','href','title','placeholder','data-testid','data-test','data-cy']) {
+              const v = el.getAttribute && el.getAttribute(name); if (v) attrs[name] = String(v).slice(0,240);
+            }
+            raw.push({
+              score: score(el,r),
+              x: Math.round(Math.max(0,Math.min(vw-1,r.left+r.width/2))),
+              y: Math.round(Math.max(0,Math.min(vh-1,r.top+r.height/2))),
+              bbox: {x:r.x,y:r.y,width:r.width,height:r.height},
+              tag: el.tagName.toLowerCase(), text, attrs, selector: cssPath(el)
+            });
+          }
+          // Remove near-duplicate nested targets that point to the same place/box.
+          raw.sort((a,b)=>a.score-b.score || a.bbox.y-b.bbox.y || a.bbox.x-b.bbox.x);
+          const kept = [];
+          for (const it of raw) {
+            const dup = kept.some(k => Math.abs(k.x-it.x)<5 && Math.abs(k.y-it.y)<5 &&
+              Math.abs(k.bbox.width-it.bbox.width)<8 && Math.abs(k.bbox.height-it.bbox.height)<8);
+            if (!dup) kept.push(it);
+            if (kept.length >= maxItems) break;
+          }
+          kept.sort((a,b)=>a.bbox.y-b.bbox.y || a.bbox.x-b.bbox.x);
+          return kept.map((it,i)=>({...it,n:i+1,kind:'smart'}));
+        }
+        """
+        try:
+            return await self.page.evaluate(script, {"maxItems": int(max_items)})
+        except Exception:
+            return []
+
+    async def screenshot_numbered(self, path: Path, targets: list, kind: str = "smart"):
+        assert self.page
+        overlay_id = "__chatgpt_number_grid__"
+        try:
+            await self.page.evaluate(
+                r"""({id, targets, kind}) => {
+                  document.getElementById(id)?.remove();
+                  const root = document.createElement('div');
+                  root.id = id;
+                  root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;font-family:Arial,sans-serif;';
+                  for (const t of targets) {
+                    const b = t.bbox;
+                    if (!b) continue;
+                    if (kind === 'grid') {
+                      const box = document.createElement('div');
+                      box.style.cssText = `position:absolute;left:${b.x}px;top:${b.y}px;width:${b.width}px;height:${b.height}px;border:1px solid rgba(255,220,0,.7);box-sizing:border-box;`;
+                      root.appendChild(box);
+                    } else {
+                      const box = document.createElement('div');
+                      box.style.cssText = `position:absolute;left:${b.x}px;top:${b.y}px;width:${b.width}px;height:${b.height}px;border:2px solid rgba(255,220,0,.92);border-radius:5px;box-sizing:border-box;`;
+                      root.appendChild(box);
+                    }
+                    const badge = document.createElement('div');
+                    const bx = Math.max(2, Math.min(window.innerWidth-42, b.x + Math.min(6,b.width/3)));
+                    const by = Math.max(2, Math.min(window.innerHeight-28, b.y + Math.min(4,b.height/3)));
+                    badge.textContent = String(t.n);
+                    badge.style.cssText = `position:absolute;left:${bx}px;top:${by}px;min-width:24px;height:24px;padding:0 5px;background:#111;color:#fff;border:2px solid #ffe000;border-radius:7px;font:bold 15px/20px Arial;text-align:center;box-sizing:border-box;box-shadow:0 1px 5px #000;`;
+                    root.appendChild(badge);
+                  }
+                  document.documentElement.appendChild(root);
+                }""",
+                {"id": overlay_id, "targets": targets, "kind": kind},
+            )
+        except Exception:
+            pass
+        try:
+            await self.page.screenshot(path=str(path), full_page=False)
+        finally:
+            try:
+                await self.page.evaluate("id => document.getElementById(id)?.remove()", overlay_id)
+            except Exception:
+                pass
+
+    async def click_number_target(self, target: dict, image_path: Optional[Path] = None):
+        """Click one numbered target and log enough detail to replay it later."""
+        assert self.page
+        async with self.control_lock:
+            x, y = int(target["x"]), int(target["y"])
+            before = await self._element_at(x, y)
+            text_blob = " ".join([
+                str(target.get("text") or ""),
+                str((target.get("attrs") or {}).get("aria-label") or ""),
+                str((target.get("attrs") or {}).get("title") or ""),
+            ])
+            before_pages = list(self.context.pages) if self.context else []
+            used_file_chooser = False
+            saved_download = None
+
+            uploadish = bool(re.search(r"上传图片|upload|choose\s*image|select\s*image|添加图片", text_blob, re.I))
+            downloadish = bool(re.search(r"download|export|下载|导出|\bGLB\b|\bOBJ\b|\bFBX\b", text_blob, re.I))
+
+            if uploadish and image_path and image_path.exists():
+                try:
+                    async with self.page.expect_file_chooser(timeout=2500) as info:
+                        await self.page.mouse.click(x, y, delay=70)
+                    chooser = await info.value
+                    await chooser.set_files(str(image_path))
+                    used_file_chooser = True
+                    await self.page.wait_for_timeout(900)
+                except Exception:
+                    # The click already happened. If Hunyuan uses a hidden file input
+                    # without a chooser, fill that input directly; never click twice.
+                    try:
+                        await self.manual_upload_file({"x": x, "y": y}, image_path)
+                        used_file_chooser = True
+                    except Exception:
+                        pass
+            elif downloadish:
+                try:
+                    async with self.page.expect_download(timeout=3500) as info:
+                        await self.page.mouse.click(x, y, delay=70)
+                    dl = await info.value
+                    saved_download = await self._save_download(dl)
+                except Exception:
+                    # The first click may have opened a format menu instead of starting
+                    # a download. Do not click twice; refresh the numbered map instead.
+                    pass
+            else:
+                await self.page.mouse.click(x, y, delay=70)
+
+            await self.page.wait_for_timeout(650)
+            if self.context:
+                new_pages = [p for p in self.context.pages if p not in before_pages]
+                if new_pages:
+                    self.page = new_pages[-1]
+                    try:
+                        await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+                    except Exception:
+                        pass
+
+            await self.log_training_action(
+                "number_click",
+                x, y,
+                {
+                    "number": int(target.get("n") or 0),
+                    "target": target,
+                    "used_file_chooser": used_file_chooser,
+                    "download": str(saved_download) if saved_download else None,
+                },
+                before=before,
+            )
+            return {"element": before, "download": saved_download, "upload": used_file_chooser}
+
     async def manual_move(self, state: dict, dx: int, dy: int):
         vp = await self._viewport()
         state["x"] = max(0, min(int(vp["w"]) - 1, int(state.get("x", vp["w"]//2)) + int(dx)))
@@ -815,12 +1042,13 @@ async def get_browser(context: ContextTypes.DEFAULT_TYPE) -> HunyuanBrowser:
 
 def _main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🖱 التحكم بالموس", callback_data="menu:control"), InlineKeyboardButton("📸 لقطة الشاشة", callback_data="menu:shot")],
-        [InlineKeyboardButton("🧪 وضع يدوي", callback_data="menu:manual"), InlineKeyboardButton("🤖 وضع تلقائي", callback_data="menu:auto")],
+        [InlineKeyboardButton("🔢 شبكة الأرقام الذكية", callback_data="menu:numsmart")],
+        [InlineKeyboardButton("🧩 شبكة الشاشة 1-60", callback_data="menu:numgrid"), InlineKeyboardButton("📸 لقطة الشاشة", callback_data="menu:shot")],
+        [InlineKeyboardButton("🧪 وضع تدريب", callback_data="menu:manual"), InlineKeyboardButton("🤖 وضع تلقائي", callback_data="menu:auto")],
         [InlineKeyboardButton("📊 حالة البوت", callback_data="menu:status"), InlineKeyboardButton("🏠 فتح Hunyuan", callback_data="menu:open")],
-        [InlineKeyboardButton("🔐 شاشة تسجيل الدخول", callback_data="menu:login"), InlineKeyboardButton("📤 إرسال سجل التدريب", callback_data="menu:exportlog")],
-        [InlineKeyboardButton("⌨️ كتابة نص", callback_data="menu:type"), InlineKeyboardButton("🏷 حفظ خطوة", callback_data="menu:mark")],
-        [InlineKeyboardButton("🧹 مسح سجل التدريب", callback_data="menu:clearlog")],
+        [InlineKeyboardButton("🔐 تسجيل الدخول", callback_data="menu:login"), InlineKeyboardButton("📦 إرسال جلسة التدريب", callback_data="menu:session")],
+        [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="menu:upload"), InlineKeyboardButton("⌨️ كتابة نص", callback_data="menu:type")],
+        [InlineKeyboardButton("🧹 جلسة جديدة", callback_data="menu:clearlog")],
     ])
 
 
@@ -833,8 +1061,9 @@ async def _send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     await msg.reply_text(
         text or (
             "🤖 بوت Hunyuan 3D — وضع التدريب\n\n"
-            "ما تحتاج تحفظ أوامر. استخدم الأزرار تحت.\n"
-            "أرسل صورة للبوت، بعدها افتح 🖱 التحكم بالموس وارفعها من زر 📎 رفع آخر صورة."
+            "ما تحتاج تحرك موس ولا تحفظ أوامر.\n"
+            "اضغط 🔢 شبكة الأرقام الذكية، راح أرقّم كل زر/عنصر قابل للضغط على الشاشة.\n"
+            "بعدها اكتب رقم العنصر فقط وأنا أضغطه وأسجل الخطوة. للأماكن غير القابلة للكشف استخدم 🧩 شبكة الشاشة 1-60."
         ),
         reply_markup=_main_menu_keyboard(),
     )
@@ -926,6 +1155,115 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{'🟠 يوجد توليد قيد التنفيذ' if busy else '🟢 جاهز'}\n"
         f"🧭 الواجهة: {mode_label}\n🌐 الصفحة الحالية: {url}"
     )
+
+
+def _number_keyboard(kind: str):
+    other = "grid" if kind == "smart" else "smart"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تحديث الأرقام", callback_data=f"num:{kind}:refresh"), InlineKeyboardButton("🔁 تبديل الشبكة", callback_data=f"num:{other}:refresh")],
+        [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="num:upload"), InlineKeyboardButton("📦 إرسال الجلسة", callback_data="menu:session")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="num:back"), InlineKeyboardButton("↻ تحديث الصفحة", callback_data="num:reload"), InlineKeyboardButton("🏠 القائمة", callback_data="menu:main")],
+    ])
+
+
+async def _save_targets_snapshot(browser: HunyuanBrowser, kind: str, targets: list, path: Path):
+    meta = {
+        "ts": time.time(), "kind": kind,
+        "url": browser.page.url if browser.page else "",
+        "viewport": await browser._viewport() if browser.page else {},
+        "targets": targets,
+    }
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_TARGETS.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Keep screenshots so the session zip can be inspected/replayed later.
+    saved = SESSION_SHOTS_DIR / path.name
+    try:
+        shutil.copy2(path, saved)
+    except Exception:
+        pass
+    shots = sorted(SESSION_SHOTS_DIR.glob("number-*.png"), key=lambda x: x.stat().st_mtime)
+    for old in shots[:-60]:
+        old.unlink(missing_ok=True)
+
+
+async def _render_number_grid(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str = "smart", query=None, note: str = ""):
+    browser = await get_browser(context)
+    if not browser.page:
+        return
+    context.application.bot_data["manual_mode"] = True
+    targets = await browser.numbered_targets(kind)
+    if kind == "smart" and not targets:
+        kind = "grid"
+        targets = await browser.numbered_targets(kind)
+        note = (note + "\n" if note else "") + "⚠️ ما اكتشفت عناصر تفاعلية، حولت تلقائياً لشبكة الشاشة."
+    context.user_data["number_mode"] = {"kind": kind, "targets": targets, "ts": time.time()}
+    path = JOBS_DIR / f"number-{int(time.time()*1000)}.png"
+    await browser.screenshot_numbered(path, targets, kind)
+    await _save_targets_snapshot(browser, kind, targets, path)
+    caption = (
+        ("🔢 شبكة العناصر الذكية" if kind == "smart" else "🧩 شبكة الشاشة") + "\n"
+        f"عدد الأرقام: {len(targets)}\n"
+        "✍️ اكتب رقم فقط في الدردشة، مثال: 12 — وأنا أضغطه مباشرة وأسجل العنصر.\n"
+        "🎯 للشغلات الصغيرة استخدم الشبكة الذكية؛ الرقم مربوط بالعنصر نفسه مو بحركة موس."
+    )
+    if note:
+        caption += f"\n{note[:500]}"
+    kb = _number_keyboard(kind)
+    try:
+        if query:
+            with path.open("rb") as f:
+                try:
+                    await query.edit_message_media(media=InputMediaPhoto(media=f, caption=caption), reply_markup=kb)
+                    return
+                except Exception:
+                    pass
+        msg = update.effective_message if update else None
+        if msg:
+            with path.open("rb") as f:
+                await msg.reply_photo(f, caption=caption, reply_markup=kb)
+        elif query:
+            with path.open("rb") as f:
+                await query.message.reply_photo(f, caption=caption, reply_markup=kb)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+async def _export_training_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    browser = await get_browser(context)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    meta = {
+        "exported_at": time.time(),
+        "url": browser.page.url if browser.page else "",
+        "title": (await browser.page.title()) if browser.page else "",
+        "viewport": await browser._viewport() if browser.page else {},
+        "manual_mode": bool(context.application.bot_data.get("manual_mode", True)),
+        "last_image": Path(context.application.bot_data.get("last_manual_image", "")).name if context.application.bot_data.get("last_manual_image") else None,
+    }
+    SESSION_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    out = JOBS_DIR / f"hunyuan-training-session-{stamp}.zip"
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        if TRAIN_LOG.exists(): z.write(TRAIN_LOG, "actions.jsonl")
+        if SESSION_TARGETS.exists(): z.write(SESSION_TARGETS, "latest-targets.json")
+        if SESSION_META.exists(): z.write(SESSION_META, "session-meta.json")
+        for fp in sorted(SESSION_SHOTS_DIR.glob("*.png"))[-60:]:
+            z.write(fp, f"screens/{fp.name}")
+        for fp in sorted(MARKS_DIR.glob("*.png"))[-30:]:
+            z.write(fp, f"marks/{fp.name}")
+    msg = update.effective_message if update.effective_message else (update.callback_query.message if update.callback_query else None)
+    if msg:
+        with out.open("rb") as f:
+            await msg.reply_document(f, filename=out.name, caption="📦 جلسة التدريب كاملة: الضغطات + العناصر + الإحداثيات + لقطات الشاشة. دزلي هذا الملف حتى أبني الأتمتة النهائية.")
+    out.unlink(missing_ok=True)
+
+
+async def _clear_training_session(context: ContextTypes.DEFAULT_TYPE):
+    TRAIN_LOG.unlink(missing_ok=True)
+    SESSION_TARGETS.unlink(missing_ok=True)
+    SESSION_META.unlink(missing_ok=True)
+    for d in (SESSION_SHOTS_DIR, MARKS_DIR):
+        for fp in d.glob("*"):
+            if fp.is_file(): fp.unlink(missing_ok=True)
+    context.user_data.pop("number_mode", None)
 
 
 def _control_keyboard(step: int):
@@ -1143,6 +1481,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "control":
         context.application.bot_data["manual_mode"] = True
         await _render_control(update, context, query=q)
+    elif action == "numsmart":
+        await _render_number_grid(update, context, "smart", query=q)
+    elif action == "numgrid":
+        await _render_number_grid(update, context, "grid", query=q)
     elif action == "manual":
         context.application.bot_data["manual_mode"] = True
         await q.message.reply_text("🧪 تم تفعيل الوضع اليدوي. الصور تنخزن فقط وماكو ضغط تلقائي.", reply_markup=_main_menu_keyboard())
@@ -1163,9 +1505,22 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await login_cmd(update, context)
     elif action == "exportlog":
         await exportlog_cmd(update, context)
+    elif action == "session":
+        await _export_training_session(update, context)
+    elif action == "upload":
+        browser = await get_browser(context)
+        last = context.application.bot_data.get("last_manual_image")
+        if not last or not Path(last).exists():
+            await q.message.reply_text("⚠️ أرسل صورة للبوت أولاً.", reply_markup=_main_menu_keyboard())
+        else:
+            try:
+                await browser.manual_upload_file(_manual_state(context), Path(last))
+                await q.message.reply_text("📎 رفعت آخر صورة. افتح 🔢 شبكة الأرقام حتى تضغط Generate.", reply_markup=_main_menu_keyboard())
+            except Exception as e:
+                await q.message.reply_text(f"❌ تعذر الرفع: {e}", reply_markup=_main_menu_keyboard())
     elif action == "clearlog":
-        TRAIN_LOG.unlink(missing_ok=True)
-        await q.message.reply_text("🧹 مسحت سجل التدريب القديم.", reply_markup=_main_menu_keyboard())
+        await _clear_training_session(context)
+        await q.message.reply_text("🧹 بدأت جلسة تدريب جديدة ومسحت السجل واللقطات القديمة.", reply_markup=_main_menu_keyboard())
     elif action == "type":
         context.user_data["awaiting_trainer_text"] = "type"
         await q.message.reply_text("⌨️ أرسل النص هسه، وأنا أكتبه بمكان المؤشر الحالي.")
@@ -1175,11 +1530,87 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def grid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _render_number_grid(update, context, "smart")
+
+
+@owner_only
+async def screen_grid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _render_number_grid(update, context, "grid")
+
+
+@owner_only
+async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _export_training_session(update, context)
+
+
+@owner_only
+async def number_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    data = (q.data or "").split(":")
+    if len(data) >= 3 and data[1] in ("smart", "grid"):
+        await _render_number_grid(update, context, data[1], query=q)
+        return
+    action = data[1] if len(data) > 1 else ""
+    browser = await get_browser(context)
+    if action == "back":
+        await browser.manual_back(_manual_state(context))
+        await _render_number_grid(update, context, context.user_data.get("number_mode", {}).get("kind", "smart"), query=q)
+    elif action == "reload":
+        await browser.manual_reload(_manual_state(context))
+        await _render_number_grid(update, context, context.user_data.get("number_mode", {}).get("kind", "smart"), query=q)
+    elif action == "upload":
+        last = context.application.bot_data.get("last_manual_image")
+        if not last or not Path(last).exists():
+            await q.message.reply_text("⚠️ أرسل صورة للبوت أولاً.")
+        else:
+            try:
+                await browser.manual_upload_file(_manual_state(context), Path(last))
+                await _render_number_grid(update, context, context.user_data.get("number_mode", {}).get("kind", "smart"), query=q, note="📎 تم رفع آخر صورة.")
+            except Exception as e:
+                await q.message.reply_text(f"❌ تعذر الرفع: {e}")
+
+
+@owner_only
 async def trainer_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.effective_message.text or "").strip()
+    mode = context.user_data.get("awaiting_trainer_text")
+
+    # Number-grid mode has priority. A plain integer is a direct click command.
+    number_state = context.user_data.get("number_mode") or {}
+    if not mode and text.isdigit() and number_state.get("targets"):
+        n = int(text)
+        targets = number_state.get("targets") or []
+        target = next((t for t in targets if int(t.get("n") or -1) == n), None)
+        if not target:
+            await update.effective_message.reply_text(f"⚠️ الرقم {n} مو موجود بالصورة الحالية. اختر من 1 إلى {len(targets)}.")
+            return
+        browser = await get_browser(context)
+        last = context.application.bot_data.get("last_manual_image")
+        image_path = Path(last) if last and Path(last).exists() else None
+        try:
+            result = await browser.click_number_target(target, image_path=image_path)
+            note_parts = [f"✅ ضغطت الرقم {n}"]
+            label = ((target.get("text") or "").strip() or target.get("selector") or "")[:120]
+            if label: note_parts.append(f"العنصر: {label}")
+            if result.get("upload"): note_parts.append("📎 وتم تمرير آخر صورة إلى اختيار الملف")
+            if result.get("download"):
+                dl = Path(result["download"])
+                with dl.open("rb") as f:
+                    await update.effective_message.reply_document(f, filename=dl.name, caption="📦 التقطت ملف التنزيل أثناء التدريب.")
+            await _render_number_grid(update, context, number_state.get("kind", "smart"), note=" | ".join(note_parts))
+        except Exception as e:
+            log.exception("Number click failed")
+            await update.effective_message.reply_text(f"❌ فشل ضغط الرقم {n}: {e}")
+        return
+
     mode = context.user_data.pop("awaiting_trainer_text", None)
     if not mode:
+        await update.effective_message.reply_text("🔢 إذا تريد تضغط رقم، افتح أولاً زر «شبكة الأرقام الذكية» من /start.", reply_markup=_main_menu_keyboard())
         return
-    text = (update.effective_message.text or "").strip()
     if not text:
         await update.effective_message.reply_text("⚠️ أرسل نص غير فارغ.", reply_markup=_main_menu_keyboard())
         return
@@ -1188,7 +1619,6 @@ async def trainer_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if mode == "type":
         await browser.manual_type(st, text)
         await update.effective_message.reply_text("⌨️ تمّت الكتابة وسجلت الخطوة.", reply_markup=_main_menu_keyboard())
-        await _render_control(update, context)
     elif mode == "mark":
         path, elem = await browser.mark_training(st, text)
         txt = json.dumps(elem, ensure_ascii=False, indent=2)[:2200]
@@ -1233,10 +1663,11 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.application.bot_data["last_manual_image"] = str(image_path)
         await msg.reply_text(
             "🧪 خزنت الصورة للتدريب وما ضغطت أي شي بالموقع.\n"
-            "اضغط 🖱 التحكم بالموس، وبعدها 📎 رفع آخر صورة.",
+            "افتح 🔢 شبكة الأرقام الذكية. إذا ضغطت رقم زر رفع الصورة راح أستخدم هاي الصورة تلقائياً، أو استخدم 📎 رفع آخر صورة.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🖱 التحكم بالموس", callback_data="menu:control")],
-                [InlineKeyboardButton("📸 لقطة الشاشة", callback_data="menu:shot"), InlineKeyboardButton("🏠 القائمة", callback_data="menu:main")],
+                [InlineKeyboardButton("🔢 شبكة الأرقام الذكية", callback_data="menu:numsmart")],
+                [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="menu:upload"), InlineKeyboardButton("📦 إرسال الجلسة", callback_data="menu:session")],
+                [InlineKeyboardButton("🏠 القائمة", callback_data="menu:main")],
             ]),
         )
         return
@@ -1328,6 +1759,9 @@ def main():
     app.add_handler(CommandHandler("manual", manual_cmd))
     app.add_handler(CommandHandler("auto", auto_cmd))
     app.add_handler(CommandHandler("control", control_cmd))
+    app.add_handler(CommandHandler("grid", grid_cmd))
+    app.add_handler(CommandHandler("screen_grid", screen_grid_cmd))
+    app.add_handler(CommandHandler("session", session_cmd))
     app.add_handler(CommandHandler("type", type_cmd))
     app.add_handler(CommandHandler("mark", mark_cmd))
     app.add_handler(CommandHandler("exportlog", exportlog_cmd))
@@ -1337,6 +1771,7 @@ def main():
     app.add_handler(CommandHandler("shot", shot_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CallbackQueryHandler(control_callback, pattern=r"^ctl:"))
+    app.add_handler(CallbackQueryHandler(number_callback, pattern=r"^num:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, trainer_text_handler))
