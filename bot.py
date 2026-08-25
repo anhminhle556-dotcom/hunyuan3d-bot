@@ -475,72 +475,206 @@ class Browser:
             return {"status":"dom_error","remaining_sec":None,"queue_count":None,"text":"","error":str(e)}
 
     async def find_text_target(self, query: str):
-        if not self.page:
+        """Find visible text across all tabs, iframes, and open shadow DOM."""
+        if not self.context:
             return None
-        script = r"""
-        ({query}) => {
-          const q=String(query||'').trim().toLowerCase();
-          if(!q) return null;
-          const clickable='button,a,label,input,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[onclick],[tabindex]';
-          function visible(el){
-            const r=el.getBoundingClientRect(),s=getComputedStyle(el);
-            return r.width>3&&r.height>3&&r.bottom>0&&r.right>0&&r.left<innerWidth&&r.top<innerHeight&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>.05;
-          }
-          function cssPath(node){
-            if(!node||node.nodeType!==1) return '';
-            if(node.id) return '#'+CSS.escape(node.id);
-            const parts=[]; let cur=node;
-            for(let depth=0;cur&&cur.nodeType===1&&depth<7;depth++,cur=cur.parentElement){
-              let part=cur.tagName.toLowerCase();
-              const cls=[...cur.classList].filter(Boolean).slice(0,2);
-              if(cls.length) part+='.'+cls.map(c=>CSS.escape(c)).join('.');
-              if(cur.parentElement){
-                const same=[...cur.parentElement.children].filter(n=>n.tagName===cur.tagName);
-                if(same.length>1) part+=`:nth-of-type(${same.indexOf(cur)+1})`;
-              }
-              parts.unshift(part); if(cur.id) break;
+
+        def norm(v):
+            v = str(v or "")
+            v = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", v)
+            v = re.sub(r"\s+", "", v)
+            return v.casefold()
+
+        qn = norm(query)
+        if not qn:
+            return None
+
+        pages = [p for p in reversed(list(self.context.pages)) if not p.is_closed()]
+        if self.page and not self.page.is_closed() and self.page in pages:
+            pages.remove(self.page)
+            pages.insert(0, self.page)
+
+        best = None
+
+        async def make_meta(locator, page, frame, source, raw_hint=""):
+            try:
+                if not await locator.is_visible(timeout=350):
+                    return None
+            except Exception:
+                return None
+            try:
+                box = await locator.bounding_box()
+            except Exception:
+                box = None
+            if not box or box.get("width", 0) < 2 or box.get("height", 0) < 2:
+                return None
+            try:
+                meta = await locator.evaluate("""el => {
+                    function cssPath(node){
+                      if(!node||node.nodeType!==1) return '';
+                      if(node.id) return '#'+CSS.escape(node.id);
+                      const parts=[]; let cur=node;
+                      for(let depth=0;cur&&cur.nodeType===1&&depth<8;depth++,cur=cur.parentElement){
+                        let part=cur.tagName.toLowerCase();
+                        const cls=[...cur.classList].filter(Boolean).slice(0,2);
+                        if(cls.length) part+='.'+cls.map(c=>CSS.escape(c)).join('.');
+                        if(cur.parentElement){
+                          const same=[...cur.parentElement.children].filter(n=>n.tagName===cur.tagName);
+                          if(same.length>1) part+=`:nth-of-type(${same.indexOf(cur)+1})`;
+                        }
+                        parts.unshift(part); if(cur.id) break;
+                      }
+                      return parts.join(' > ');
+                    }
+                    const attrs={};
+                    for(const n of ['id','class','role','aria-label','name','type','href','title','placeholder','data-testid','data-test','data-cy']){
+                      const v=el.getAttribute&&el.getAttribute(n); if(v) attrs[n]=String(v).slice(0,300);
+                    }
+                    const text=(el.innerText||el.textContent||el.getAttribute?.('aria-label')||el.getAttribute?.('title')||'').replace(/\\s+/g,' ').trim();
+                    return {tag:(el.tagName||'').toLowerCase(), text:text.slice(0,500), attrs, selector:cssPath(el)};
+                }""")
+            except Exception:
+                meta = {"tag": "", "text": raw_hint or "", "attrs": {}, "selector": ""}
+            raw = str(meta.get("text") or raw_hint or "")
+            exact = 0 if norm(raw) == qn else 1
+            contains = 0 if qn in norm(raw) else 1
+            area = float(box.get("width", 0)) * float(box.get("height", 0))
+            score = exact * 100000000 + contains * 10000000 + area
+            return {
+                "score": score,
+                "page": page,
+                "frame": frame,
+                "meta": {
+                    "x": round(float(box["x"]) + float(box["width"]) / 2),
+                    "y": round(float(box["y"]) + float(box["height"]) / 2),
+                    "tag": meta.get("tag", ""),
+                    "text": raw[:500],
+                    "matched_text": (raw_hint or raw)[:500],
+                    "attrs": meta.get("attrs") or {},
+                    "selector": meta.get("selector") or "",
+                    "bbox": {k: box.get(k) for k in ("x", "y", "width", "height")},
+                    "page_url": page.url,
+                    "frame_url": frame.url,
+                    "match_source": source,
+                },
             }
-            return parts.join(' > ');
-          }
-          const all=[...document.querySelectorAll('body *')];
-          let best=null;
-          for(const el of all){
-            if(!visible(el)) continue;
-            const raw=(el.innerText||el.textContent||el.getAttribute('aria-label')||el.getAttribute('title')||'').replace(/\s+/g,' ').trim();
-            if(!raw||!raw.toLowerCase().includes(q)) continue;
-            let target=el.closest(clickable);
-            if(!target){
-              let cur=el;
-              for(let i=0;i<4&&cur;i++,cur=cur.parentElement){
-                try{ if(getComputedStyle(cur).cursor==='pointer'){target=cur;break;} }catch(_){}
-              }
-            }
-            target=target||el;
-            if(!visible(target)) continue;
-            const r=target.getBoundingClientRect();
-            const exact=raw.toLowerCase()===q?0:1;
-            const area=r.width*r.height;
-            const score=exact*100000+area;
-            if(!best||score<best.score) best={target,raw,score};
-          }
-          if(!best) return null;
-          const el=best.target,r=el.getBoundingClientRect(),attrs={};
-          for(const n of ['id','class','role','aria-label','name','type','href','title','placeholder','data-testid','data-test','data-cy']){
-            const v=el.getAttribute&&el.getAttribute(n); if(v) attrs[n]=String(v).slice(0,300);
-          }
-          return {
-            x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2),
-            tag:el.tagName.toLowerCase(),
-            text:(el.innerText||el.textContent||best.raw).replace(/\s+/g,' ').trim().slice(0,500),
-            matched_text:best.raw.slice(0,500),
-            attrs, selector:cssPath(el),
-            bbox:{x:r.x,y:r.y,width:r.width,height:r.height}
-          };
-        }"""
+
+        for page in pages:
+            for frame in list(page.frames):
+                locators = []
+                try:
+                    locators.extend([
+                        (frame.get_by_role("button", name=re.compile(re.escape(query), re.I)), "role_button"),
+                        (frame.get_by_role("link", name=re.compile(re.escape(query), re.I)), "role_link"),
+                        (frame.get_by_text(query, exact=True), "text_exact"),
+                        (frame.get_by_text(query, exact=False), "text_contains"),
+                    ])
+                except Exception:
+                    pass
+
+                for locator, source in locators:
+                    try:
+                        count = await asyncio.wait_for(locator.count(), timeout=1.1)
+                    except Exception:
+                        count = 0
+                    for i in range(min(int(count or 0), 12)):
+                        try:
+                            cand = await make_meta(locator.nth(i), page, frame, source)
+                        except Exception:
+                            cand = None
+                        if cand and (best is None or cand["score"] < best["score"]):
+                            best = cand
+                    if best and best["score"] < 10000000:
+                        break
+
+                if best and best["score"] < 10000000:
+                    continue
+
+                deep_script = """
+                ({query}) => {
+                  const clean=s=>String(s||'').replace(/[\\u200b-\\u200f\\u2060\\ufeff]/g,'').replace(/\\s+/g,'').toLowerCase();
+                  const q=clean(query); if(!q) return null;
+                  const seen=new Set(), nodes=[];
+                  function walk(root){
+                    if(!root||seen.has(root)) return; seen.add(root);
+                    let list=[]; try{list=[...root.querySelectorAll('*')]}catch(_){return}
+                    for(const el of list){nodes.push(el); if(el.shadowRoot) walk(el.shadowRoot);}
+                  }
+                  walk(document);
+                  const clickable='button,a,label,input,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[onclick],[tabindex]';
+                  function visible(el){
+                    try{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>2&&r.height>2&&r.bottom>0&&r.right>0&&r.left<innerWidth&&r.top<innerHeight&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>.03}catch(_){return false}
+                  }
+                  let best=null;
+                  for(const el of nodes){
+                    if(!visible(el)) continue;
+                    const raw=(el.innerText||el.textContent||el.getAttribute?.('aria-label')||el.getAttribute?.('title')||el.getAttribute?.('value')||'').replace(/\\s+/g,' ').trim();
+                    if(!raw||!clean(raw).includes(q)) continue;
+                    let target=null;
+                    try{target=el.closest(clickable)}catch(_){}
+                    if(!target){
+                      let cur=el;
+                      for(let i=0;i<7&&cur;i++,cur=cur.parentElement){
+                        try{if(getComputedStyle(cur).cursor==='pointer'){target=cur;break}}catch(_){}
+                      }
+                    }
+                    target=target||el; if(!visible(target)) continue;
+                    const r=target.getBoundingClientRect();
+                    const score=(clean(raw)===q?0:1)*100000000+(r.width*r.height);
+                    if(!best||score<best.score) best={raw,score,x:r.left+r.width/2,y:r.top+r.height/2,tag:(target.tagName||'').toLowerCase()};
+                  }
+                  return best;
+                }
+                """
+                try:
+                    raw = await asyncio.wait_for(frame.evaluate(deep_script, {"query": query}), timeout=1.3)
+                except Exception:
+                    raw = None
+                if raw:
+                    x = float(raw.get("x", 0)); y = float(raw.get("y", 0))
+                    if frame != page.main_frame:
+                        try:
+                            fe = await frame.frame_element()
+                            fb = await fe.bounding_box()
+                            if fb:
+                                x += float(fb.get("x", 0)); y += float(fb.get("y", 0))
+                        except Exception:
+                            pass
+                    cand = {
+                        "score": float(raw.get("score", 999999999)),
+                        "page": page,
+                        "frame": frame,
+                        "meta": {
+                            "x": round(x), "y": round(y), "tag": raw.get("tag", ""),
+                            "text": str(raw.get("raw") or "")[:500],
+                            "matched_text": str(raw.get("raw") or "")[:500],
+                            "attrs": {}, "selector": "", "bbox": {},
+                            "page_url": page.url, "frame_url": frame.url,
+                            "match_source": "deep_shadow_dom",
+                        },
+                    }
+                    if best is None or cand["score"] < best["score"]:
+                        best = cand
+
+        if not best:
+            try:
+                self.last_text_search_debug = {
+                    "query": query,
+                    "pages": [{"url": p.url, "frames": [f.url for f in p.frames]} for p in pages],
+                    "at": time.time(),
+                }
+            except Exception:
+                pass
+            return None
+
+        found_page = best["page"]
+        self.page = found_page
         try:
-            return await self.page.evaluate(script, {"query": query})
+            await found_page.bring_to_front()
         except Exception:
-            return None
+            pass
+        self.last_text_search_debug = {"query": query, "found": best["meta"], "at": time.time()}
+        return best["meta"]
 
     async def save_download(self, download):
         name = download.suggested_filename or f"hunyuan-{int(time.time())}.glb"
@@ -1547,7 +1681,7 @@ async def menu_callback(update: Update, context):
         await render_control(update, context, query=q)
     elif action == "textclick":
         context.user_data["awaiting_text"] = "text_click"
-        await q.message.reply_text("🔎 اكتب أي نص ظاهر على الموقع، وأنا أضغط أفضل تطابق وأسجل before/after والوقت.")
+        await q.message.reply_text("🔎 اكتب النص مثل ما ظاهر بالشاشة. أبحث بكل التبويبات + الإطارات + Shadow DOM وأضغطه وأسجل before/after والوقت.")
     elif action == "upload":
         browser = await get_browser(context)
         last = context.application.bot_data.get("last_manual_image")
@@ -1602,7 +1736,7 @@ async def text_handler(update: Update, context):
     if mode == "text_click":
         target = await browser.find_text_target(text)
         if not target:
-            await update.effective_message.reply_text(f"❌ ما لكيت النص: {text}\nجرّب جزء أقصر من الكتابة.", reply_markup=main_menu())
+            await update.effective_message.reply_text(f"❌ ما لكيت النص: {text} حتى بعد البحث بكل التبويبات والإطارات. استخدم 🎮 التحكم بالموس لهذي الضغطة فقط، وهي تنحفظ بالجلسة.", reply_markup=main_menu())
             return
         async def do_text_click():
             dl = await browser.click_xy(int(target["x"]), int(target["y"]), 1)
