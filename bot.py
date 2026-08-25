@@ -43,8 +43,14 @@ WATCH_MAX_MIN = int(os.environ.get("WATCH_MAX_MIN", "30"))
 TIMELINE_FRAME_EVERY_SEC = int(os.environ.get("TIMELINE_FRAME_EVERY_SEC", "10"))
 TIMELINE_DIR = SHOTS_DIR / "timeline"
 TIMELINE_FILE = SESSION_DIR / "timeline_frames.jsonl"
+# OS-level recorder files. These are written by start.sh in a separate process,
+# completely outside the Telegram/Playwright event loop.
+OS_TIMELINE_DIR = SHOTS_DIR / "os_timeline"
+OS_TIMELINE_FILE = SESSION_DIR / "os_timeline.jsonl"
+OS_LATEST = OS_TIMELINE_DIR / "latest.png"
+GEN_STREAM_MARKER = SESSION_DIR / ".generation_stream"
 
-for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, SESSION_DIR, SHOTS_DIR):
+for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, SESSION_DIR, SHOTS_DIR, OS_TIMELINE_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -113,6 +119,31 @@ def ensure_session() -> dict:
     }
     save_meta(meta)
     return meta
+
+
+def enable_generation_stream(reason: str = "generate"):
+    """Tell the OS sidecar recorder to stream periodic screenshots to Telegram."""
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"started_at": time.time(), "reason": reason, "owner_id": OWNER_ID}
+    GEN_STREAM_MARKER.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def disable_generation_stream():
+    try:
+        GEN_STREAM_MARKER.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def latest_os_frame() -> Optional[Path]:
+    """Return the latest screenshot produced by the independent shell recorder."""
+    try:
+        if OS_LATEST.exists() and OS_LATEST.stat().st_size > 1000:
+            return OS_LATEST
+        frames = sorted(OS_TIMELINE_DIR.glob("frame_*.png"), key=lambda x: x.stat().st_mtime, reverse=True)
+        return frames[0] if frames else None
+    except Exception:
+        return None
 
 
 def read_events() -> list:
@@ -592,6 +623,12 @@ async def record_action(context, action: str, perform, *, element=None, extra=No
     if screenshot:
         before_path = await capture_session_screenshot(browser, seq, action, "before", st)
 
+    # Guess intent before the actual click. If this is Generate, arm the independent
+    # OS recorder BEFORE the page can become WebGL-heavy or block Playwright.
+    intent = guess_intent(action, element, extra)
+    if intent in ("upload_image", "generate_3d"):
+        enable_generation_stream(intent)
+
     result = None
     error = None
     try:
@@ -608,7 +645,6 @@ async def record_action(context, action: str, perform, *, element=None, extra=No
     ended = time.time()
     last_event = meta.get("last_event_at")
     last_meaningful = meta.get("last_meaningful_at")
-    intent = guess_intent(action, element, extra)
     event = {
         "seq": seq,
         "action": action,
@@ -632,6 +668,8 @@ async def record_action(context, action: str, perform, *, element=None, extra=No
         "meaningful": bool(meaningful),
     }
     append_event(event)
+    if intent == "download_model":
+        disable_generation_stream()
     meta["event_count"] = seq
     meta["last_event_at"] = now
     if meaningful:
@@ -897,7 +935,10 @@ async def generation_watch_loop(application, chat_id:int):
 
 def start_generation_watch(context, chat_id:int):
     task=context.application.bot_data.get("generation_watch_task")
-    if task and not task.done(): return False
+    if task and not task.done():
+        enable_generation_stream("manual_watch")
+        return False
+    enable_generation_stream("manual_watch")
     context.application.bot_data["generation_watch_stop"]=False
     context.application.bot_data["generation_watch_task"]=context.application.create_task(generation_watch_loop(context.application,chat_id))
     return True
@@ -1051,7 +1092,10 @@ async def export_session(update: Update, context):
         "events.jsonl: full machine-readable timeline.\n"
         "workflow.json: compact ordered workflow with observed waits.\n"
         "replay_plan.py: code-like Playwright replay plan generated from the actions.\n"
-        "screens/: before/after X11 screenshots for real page actions.\ntimeline_frames.jsonl + screens/timeline/: ALWAYS-ON X11 screenshots for the entire session, including loading screens.\ngeneration_frames.jsonl + screens/generation_frames/: generation-specific X11 screenshots when Generate was detected.\n"
+        "screens/: before/after screenshots for real page actions.\n"
+        "os_timeline.jsonl + screens/os_timeline/: OS-level screenshots captured by a separate shell process every 5s, independent from Python/Playwright/WebGL.\n"
+        "timeline_frames.jsonl + screens/timeline/: Python-side X11 screenshots (secondary).\n"
+        "generation_frames.jsonl + screens/generation_frames/: generation-specific Python-side frames (secondary).\n"
         "summary.json: session metadata.\n\n"
         "Security: browser cookies, passwords and the Chrome profile are NOT exported.\n"
     )
@@ -1076,6 +1120,7 @@ async def export_session(update: Update, context):
                 "دز هذا الـZIP إلي حتى أبني الأتمتة النهائية."
             ),
         )
+    disable_generation_stream()
 
 
 async def clear_session(update: Update, context):
@@ -1093,6 +1138,8 @@ async def clear_session(update: Update, context):
         shutil.rmtree(SESSION_DIR)
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    OS_TIMELINE_DIR.mkdir(parents=True, exist_ok=True)
+    disable_generation_stream()
     ensure_session()
     context.application.bot_data["timeline_stop"] = False
     start_timeline_recorder(context.application)
@@ -1104,8 +1151,8 @@ async def clear_session(update: Update, context):
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 التحكم بالموس", callback_data="menu:control"), InlineKeyboardButton("🔎 اضغط كتابة", callback_data="menu:textclick")],
-        [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="menu:upload"), InlineKeyboardButton("📸 لقطة X11 الآن", callback_data="menu:snapshot")],
-        [InlineKeyboardButton("⏳ متابعة التوليد", callback_data="menu:watchstart"), InlineKeyboardButton("🛑 إيقاف المتابعة", callback_data="menu:watchstop")],
+        [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="menu:upload"), InlineKeyboardButton("📸 لقطة الآن", callback_data="menu:snapshot")],
+        [InlineKeyboardButton("📡 ابدأ بث التوليد", callback_data="menu:watchstart"), InlineKeyboardButton("🛑 أوقف البث", callback_data="menu:watchstop")],
         [InlineKeyboardButton("📦 حفظ وإرسال الجلسة", callback_data="menu:session")],
         [InlineKeyboardButton("🧹 جلسة جديدة", callback_data="menu:newsession"), InlineKeyboardButton("📊 الحالة", callback_data="menu:status")],
         [InlineKeyboardButton("🏠 فتح Hunyuan", callback_data="menu:open"), InlineKeyboardButton("🔐 تسجيل الدخول", callback_data="menu:login")],
@@ -1229,15 +1276,21 @@ async def open_cmd(update: Update, context):
 
 @owner_only
 async def shot_cmd(update: Update, context):
-    browser = await get_browser(context)
-    st = manual_state(context)
-    event, _ = await record_observation(context, "snapshot", {"source": "shot_command"})
-    p = SESSION_DIR / str(event.get("screenshot_after") or "")
-    if not p.exists():
-        p = JOBS_DIR / f"shot-{int(time.time())}.png"
-        await browser.screenshot_cursor(p, int(st["x"]), int(st["y"]))
-    with p.open("rb") as f:
-        await update.effective_message.reply_photo(f, caption=f"📸 لقطة محفوظة بالجلسة\n🌐 {browser.page.url if browser.page else ''}")
+    # Never ask Chromium for a screenshot here. Use the latest frame from the
+    # independent OS recorder so /shot still works while WebGL is loading.
+    frame = latest_os_frame()
+    if not frame:
+        await update.effective_message.reply_text("⚠️ مسجل الشاشة الخارجي بعده ما كتب أول لقطة. انتظر 5 ثواني وجرب /shot.")
+        return
+    try:
+        age = max(0.0, time.time() - frame.stat().st_mtime)
+    except Exception:
+        age = 0.0
+    with frame.open("rb") as f:
+        await update.effective_message.reply_photo(
+            f,
+            caption=f"📸 لقطة من المسجل الخارجي المستقل\n⏱ عمر اللقطة: {age:.1f}ث\nحتى أثناء تحميل WebGL ما تعتمد على Playwright.",
+        )
 
 
 @owner_only
@@ -1255,8 +1308,10 @@ async def status_cmd(update: Update, context):
         f"🧾 الخطوات المهمة: {meta.get('meaningful_count',0)}\n"
         f"⏱ مدة الجلسة: {elapsed/60:.1f} دقيقة\n"
         f"⏳ منذ آخر خطوة مهمة: {wait:.1f} ثانية\n"
-        f"👁 متابعة التوليد: {watch}\n"        f"📸 تسجيل الجلسة المستمر: {'شغال ✅' if context.application.bot_data.get('timeline_task') and not context.application.bot_data.get('timeline_task').done() else 'متوقف ❌'} | كل {TIMELINE_FRAME_EVERY_SEC}ث\n"
-
+        f"👁 متابعة التوليد: {watch}\n"
+        f"📡 بث لقطات التوليد الخارجي: {'شغال ✅' if GEN_STREAM_MARKER.exists() else 'متوقف ⚪'}\n"
+        f"🖥 مسجل OS المستقل: {'عنده لقطة ✅' if latest_os_frame() else 'ينتظر أول لقطة ⏳'} | كل 5ث\n"
+        f"📸 تسجيل Python الإضافي: {'شغال ✅' if context.application.bot_data.get('timeline_task') and not context.application.bot_data.get('timeline_task').done() else 'متوقف ❌'} | كل {TIMELINE_FRAME_EVERY_SEC}ث\n"
         f"🌐 {browser.page.url if browser.page else ''}",
         reply_markup=main_menu(),
     )
@@ -1345,9 +1400,8 @@ async def control_callback(update: Update, context):
                 event, _ = await record_action(context, "scroll", do_scroll, extra={"delta": delta}, screenshot=True, meaningful=False)
                 note = f"✅ سكرول محفوظ كحدث #{event['seq']}"
             elif action == "snapshot":
-                event, _ = await record_observation(context, "snapshot", {"source": "control"})
-                wait = event.get("wait_since_previous_meaningful_action_sec")
-                note = f"📸 لقطة محفوظة | ⏳ من آخر خطوة مهمة: {(wait or 0):.1f}ث"
+                frame = latest_os_frame()
+                note = "📸 آخر لقطة من مسجل OS جاهزة." if frame else "⚠️ مسجل OS بعده ما كتب أول لقطة."
             elif action == "back":
                 async def do_back():
                     try:
@@ -1411,7 +1465,8 @@ async def control_callback(update: Update, context):
                 note = "⏳ بدأت متابعة التوليد بالخلفية." if start_generation_watch(context, q.message.chat_id) else "ℹ️ المتابعة شغالة أصلاً."
             elif action == "watchstop":
                 context.application.bot_data["generation_watch_stop"] = True
-                note = "🛑 طلبت إيقاف المتابعة. الجلسة تبقى محفوظة."
+                disable_generation_stream()
+                note = "🛑 طلبت إيقاف المتابعة والبث. الجلسة تبقى محفوظة."
             elif action == "session":
                 await export_session(update, context)
                 return
@@ -1455,9 +1510,12 @@ async def menu_callback(update: Update, context):
             except Exception as e:
                 await q.message.reply_text(f"❌ الرفع فشل: {e}", reply_markup=main_menu())
     elif action == "snapshot":
-        event, _ = await record_observation(context, "snapshot", {"source": "menu"})
-        wait = event.get("wait_since_previous_meaningful_action_sec") or 0
-        await q.message.reply_text(f"📸 حفظت لقطة. مرّ {wait:.1f} ثانية من آخر خطوة مهمة.", reply_markup=main_menu())
+        frame = latest_os_frame()
+        if not frame:
+            await q.message.reply_text("⚠️ بعد ماكو لقطة من مسجل OS. انتظر 5 ثواني.", reply_markup=main_menu())
+        else:
+            with frame.open("rb") as f:
+                await q.message.reply_photo(f, caption="📸 آخر لقطة من المسجل الخارجي المستقل", reply_markup=main_menu())
     elif action == "watchstart":
         if start_generation_watch(context, q.message.chat_id):
             await q.message.reply_text("⏳ بدأت متابعة التوليد. أسجل الوقت ولقطات دورية بدون أي ضغط على الموقع.", reply_markup=main_menu())
@@ -1465,7 +1523,8 @@ async def menu_callback(update: Update, context):
             await q.message.reply_text("ℹ️ متابعة التوليد شغالة أصلاً.", reply_markup=main_menu())
     elif action == "watchstop":
         context.application.bot_data["generation_watch_stop"] = True
-        await q.message.reply_text("🛑 راح أوقف المتابعة بأقرب دورة فحص. الجلسة ما تنمسح.", reply_markup=main_menu())
+        disable_generation_stream()
+        await q.message.reply_text("🛑 أوقفت متابعة التوليد وبث اللقطات. الجلسة ما تنمسح.", reply_markup=main_menu())
     elif action == "session":
         await export_session(update, context)
     elif action == "newsession":
@@ -1586,6 +1645,7 @@ async def post_init(app: Application):
 
 
 async def post_shutdown(app: Application):
+    disable_generation_stream()
     app.bot_data["generation_watch_stop"] = True
     task=app.bot_data.get("generation_watch_task")
     if task and not task.done():
