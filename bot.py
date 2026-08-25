@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -8,11 +9,12 @@ from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -33,8 +35,12 @@ JOBS_DIR = DATA_DIR / "jobs"
 DOWNLOADS_DIR = DATA_DIR / "downloads"
 HUNYUAN_URL = os.environ.get("HUNYUAN_URL", "https://3d.hunyuan.tencent.com/")
 GENERATION_TIMEOUT_MIN = int(os.environ.get("GENERATION_TIMEOUT_MIN", "25"))
+MANUAL_DEFAULT = os.environ.get("MANUAL_DEFAULT", "1").strip().lower() not in ("0", "false", "no", "off")
+TRAIN_DIR = DATA_DIR / "training"
+TRAIN_LOG = TRAIN_DIR / "actions.jsonl"
+MARKS_DIR = TRAIN_DIR / "marks"
 
-for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR):
+for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, MARKS_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -565,6 +571,222 @@ class HunyuanBrowser:
         await download.save_as(str(target))
         return target
 
+    async def _viewport(self):
+        assert self.page
+        try:
+            return await self.page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+        except Exception:
+            return {"w": 1365, "h": 768}
+
+    async def _element_at(self, x: int, y: int):
+        assert self.page
+        script = r"""
+        ({x, y}) => {
+          const el = document.elementFromPoint(x, y);
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          const txt = (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim().slice(0,300);
+          const attrs = {};
+          for (const name of ['id','class','role','aria-label','name','type','href','title','placeholder','data-testid','data-test','data-cy']) {
+            const v = el.getAttribute && el.getAttribute(name);
+            if (v) attrs[name] = v.slice(0,300);
+          }
+          function cssPath(node) {
+            if (!node || node.nodeType !== 1) return '';
+            if (node.id) return '#' + CSS.escape(node.id);
+            const parts = [];
+            let cur = node;
+            for (let depth=0; cur && cur.nodeType===1 && depth<6; depth++, cur=cur.parentElement) {
+              let part = cur.tagName.toLowerCase();
+              const cls = [...cur.classList].filter(Boolean).slice(0,2);
+              if (cls.length) part += '.' + cls.map(c => CSS.escape(c)).join('.');
+              if (cur.parentElement) {
+                const same = [...cur.parentElement.children].filter(n => n.tagName === cur.tagName);
+                if (same.length > 1) part += `:nth-of-type(${same.indexOf(cur)+1})`;
+              }
+              parts.unshift(part);
+              if (cur.id) break;
+            }
+            return parts.join(' > ');
+          }
+          return {
+            tag: el.tagName.toLowerCase(),
+            text: txt,
+            attrs,
+            selector: cssPath(el),
+            bbox: {x:r.x, y:r.y, width:r.width, height:r.height},
+            outerHTML: (el.outerHTML || '').slice(0,1000)
+          };
+        }
+        """
+        try:
+            return await self.page.evaluate(script, {"x": int(x), "y": int(y)})
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _append_training(self, record: dict):
+        record = dict(record)
+        record.setdefault("ts", time.time())
+        TRAIN_DIR.mkdir(parents=True, exist_ok=True)
+        with TRAIN_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    async def log_training_action(self, action: str, x: int = None, y: int = None, extra: dict = None, before=None):
+        url = self.page.url if self.page else ""
+        title = ""
+        try:
+            title = await self.page.title() if self.page else ""
+        except Exception:
+            pass
+        vp = await self._viewport() if self.page else {"w": 0, "h": 0}
+        rec = {"action": action, "x": x, "y": y, "url": url, "title": title, "viewport": vp}
+        if before is not None:
+            rec["element_before"] = before
+        if extra:
+            rec["extra"] = extra
+        self._append_training(rec)
+
+    async def screenshot_with_cursor(self, path: Path, x: int, y: int):
+        assert self.page
+        overlay_id = "__chatgpt_mouse_cursor__"
+        try:
+            await self.page.evaluate(
+                r"""({id,x,y}) => {
+                    const old = document.getElementById(id); if (old) old.remove();
+                    const d = document.createElement('div');
+                    d.id = id;
+                    d.style.cssText = `position:fixed;left:${x-16}px;top:${y-16}px;width:32px;height:32px;border:3px solid #ff2d2d;border-radius:50%;z-index:2147483647;pointer-events:none;box-sizing:border-box;box-shadow:0 0 0 2px white;`;
+                    const h = document.createElement('div');
+                    h.style.cssText = 'position:absolute;left:13px;top:-8px;width:2px;height:48px;background:#ff2d2d;';
+                    const v = document.createElement('div');
+                    v.style.cssText = 'position:absolute;left:-8px;top:13px;width:48px;height:2px;background:#ff2d2d;';
+                    d.appendChild(h); d.appendChild(v); document.documentElement.appendChild(d);
+                }""",
+                {"id": overlay_id, "x": int(x), "y": int(y)},
+            )
+        except Exception:
+            pass
+        try:
+            await self.page.screenshot(path=str(path), full_page=False)
+        finally:
+            try:
+                await self.page.evaluate("id => document.getElementById(id)?.remove()", overlay_id)
+            except Exception:
+                pass
+
+    async def manual_move(self, state: dict, dx: int, dy: int):
+        vp = await self._viewport()
+        state["x"] = max(0, min(int(vp["w"]) - 1, int(state.get("x", vp["w"]//2)) + int(dx)))
+        state["y"] = max(0, min(int(vp["h"]) - 1, int(state.get("y", vp["h"]//2)) + int(dy)))
+        await self.log_training_action("move", state["x"], state["y"], {"dx": dx, "dy": dy})
+
+    async def manual_click(self, state: dict, count: int = 1):
+        assert self.page
+        x, y = int(state["x"]), int(state["y"])
+        before = await self._element_at(x, y)
+        before_pages = list(self.context.pages) if self.context else []
+        await self.page.mouse.click(x, y, click_count=count, delay=80)
+        await self.page.wait_for_timeout(650)
+        if self.context:
+            new_pages = [p for p in self.context.pages if p not in before_pages]
+            if new_pages:
+                self.page = new_pages[-1]
+                try:
+                    await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+                except Exception:
+                    pass
+        await self.log_training_action("double_click" if count == 2 else "click", x, y, before=before)
+        return before
+
+    async def manual_scroll(self, state: dict, delta: int):
+        assert self.page
+        x, y = int(state["x"]), int(state["y"])
+        before = await self._element_at(x, y)
+        await self.page.mouse.move(x, y)
+        await self.page.mouse.wheel(0, int(delta))
+        await self.page.wait_for_timeout(500)
+        await self.log_training_action("scroll", x, y, {"delta": delta}, before=before)
+
+    async def manual_key(self, state: dict, key: str):
+        assert self.page
+        x, y = int(state["x"]), int(state["y"])
+        before = await self._element_at(x, y)
+        await self.page.keyboard.press(key)
+        await self.page.wait_for_timeout(350)
+        await self.log_training_action("key", x, y, {"key": key}, before=before)
+
+    async def manual_type(self, state: dict, text: str):
+        assert self.page
+        x, y = int(state["x"]), int(state["y"])
+        before = await self._element_at(x, y)
+        await self.page.mouse.click(x, y)
+        await self.page.keyboard.insert_text(text)
+        await self.page.wait_for_timeout(300)
+        await self.log_training_action("type", x, y, {"text": text[:500]}, before=before)
+
+    async def manual_back(self, state: dict):
+        assert self.page
+        await self.log_training_action("back", int(state["x"]), int(state["y"]))
+        try:
+            await self.page.go_back(wait_until="domcontentloaded", timeout=12000)
+        except Exception:
+            pass
+        await self.page.wait_for_timeout(500)
+
+    async def manual_reload(self, state: dict):
+        assert self.page
+        await self.log_training_action("reload", int(state["x"]), int(state["y"]))
+        try:
+            await self.page.reload(wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        await self.page.wait_for_timeout(500)
+
+    async def manual_open_home(self, state: dict):
+        assert self.page
+        await self.log_training_action("open_home", int(state["x"]), int(state["y"]), {"target": HUNYUAN_URL})
+        await self.page.goto(HUNYUAN_URL, wait_until="domcontentloaded", timeout=60000)
+        await self.page.wait_for_timeout(800)
+
+    async def manual_upload_file(self, state: dict, image_path: Path):
+        assert self.page
+        inputs = self.page.locator('input[type="file"]')
+        count = await inputs.count()
+        if count == 0:
+            raise RuntimeError("ماكو input رفع ظاهر بالصفحة الحالية.")
+        candidates = []
+        for i in range(count):
+            el = inputs.nth(i)
+            try:
+                accept = ((await el.get_attribute("accept")) or "").lower()
+                score = 0 if "image" in accept else (1 if not accept else 2)
+                candidates.append((score, i, el, accept))
+            except Exception:
+                candidates.append((3, i, el, ""))
+        candidates.sort(key=lambda t: (t[0], t[1]))
+        last_err = None
+        for _, i, el, accept in candidates:
+            try:
+                meta = await el.evaluate(r"""el => ({tag:el.tagName.toLowerCase(), id:el.id||'', name:el.name||'', accept:el.accept||'', outerHTML:(el.outerHTML||'').slice(0,1000)})""")
+                await el.set_input_files(str(image_path))
+                await self.page.wait_for_timeout(1200)
+                n = await el.evaluate("el => el.files ? el.files.length : 0")
+                if int(n or 0) > 0:
+                    await self.log_training_action("upload_file", int(state["x"]), int(state["y"]), {"input_index": i, "accept": accept, "input": meta, "file_name": image_path.name})
+                    return meta
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"حاولت حقول الرفع بس ما قبلت الصورة: {last_err or 'unknown'}")
+
+    async def mark_training(self, state: dict, name: str):
+        assert self.page
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())[:80] or "mark"
+        path = MARKS_DIR / f"{int(time.time())}-{safe}.png"
+        await self.screenshot_with_cursor(path, int(state["x"]), int(state["y"]))
+        elem = await self._element_at(int(state["x"]), int(state["y"]))
+        await self.log_training_action("mark", int(state["x"]), int(state["y"]), {"name": name, "screenshot": str(path)}, before=elem)
+        return path, elem
+
     async def generate(self, image_path: Path, progress_cb=None) -> Path:
         async with self.lock:
             # IMPORTANT: do not navigate to HUNYUAN_URL here. The root URL can
@@ -595,11 +817,17 @@ async def get_browser(context: ContextTypes.DEFAULT_TYPE) -> HunyuanBrowser:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 بوت Hunyuan 3D — بدون API\n\n"
-        "1) افتح /login وسجّل دخولك في Hunyuan مرة واحدة.\n"
-        "2) بعد تسجيل الدخول ارجع للبوت وأرسل صورة.\n"
-        "3) البوت يرفعها للموقع وينتظر التوليد ثم يرسل ملف 3D.\n\n"
+        "هسه الوضع الافتراضي تدريب يدوي حتى نعلّم البوت الواجهة الحقيقية بدون تخمين.\n"
+        "أرسل صورة، وبعدها استخدم /control للتحكم بالماوس من تيليجرام.\n\n"
         "الأوامر:\n"
-        "/login — فتح رابط المتصفح لتسجيل الدخول\n"
+        "/control — شبكة موس وتحكم يدوي من تيليجرام\n"
+        "/manual — وضع التدريب اليدوي (الافتراضي)\n"
+        "/auto — تشغيل الأتمتة القديمة بعد ما نخلص التدريب\n"
+        "/type نص — كتابة النص بالمكان الحالي للمؤشر\n"
+        "/mark اسم — حفظ خطوة مهمة مع معلومات العنصر\n"
+        "/exportlog — إرسال سجل كل الضغطات للتدريب\n"
+        "/clearlog — مسح سجل التدريب والبدء من جديد\n"
+        "/login — رابط المتصفح لتسجيل الدخول\n"
         "/shot — لقطة شاشة لحالة الموقع\n"
         "/open — إعادة فتح Hunyuan\n"
         "/status — حالة البوت"
@@ -689,6 +917,196 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _control_keyboard(step: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↖️", callback_data="ctl:ul"), InlineKeyboardButton("⬆️", callback_data="ctl:u"), InlineKeyboardButton("↗️", callback_data="ctl:ur")],
+        [InlineKeyboardButton("⬅️", callback_data="ctl:l"), InlineKeyboardButton("🖱 ضغط", callback_data="ctl:click"), InlineKeyboardButton("➡️", callback_data="ctl:r")],
+        [InlineKeyboardButton("↙️", callback_data="ctl:dl"), InlineKeyboardButton("⬇️", callback_data="ctl:d"), InlineKeyboardButton("↘️", callback_data="ctl:dr")],
+        [InlineKeyboardButton("🖱×2", callback_data="ctl:dbl"), InlineKeyboardButton(f"📏 {step}px", callback_data="ctl:step"), InlineKeyboardButton("👁 فحص", callback_data="ctl:inspect")],
+        [InlineKeyboardButton("⇧ سكرول", callback_data="ctl:su"), InlineKeyboardButton("⇩ سكرول", callback_data="ctl:sd"), InlineKeyboardButton("🔄 صورة", callback_data="ctl:refresh")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="ctl:back"), InlineKeyboardButton("↻ تحديث", callback_data="ctl:reload"), InlineKeyboardButton("🏠 Hunyuan", callback_data="ctl:home")],
+        [InlineKeyboardButton("📎 رفع آخر صورة", callback_data="ctl:upload"), InlineKeyboardButton("↵ Enter", callback_data="ctl:enter"), InlineKeyboardButton("Esc", callback_data="ctl:esc")],
+    ])
+
+
+def _manual_state(context: ContextTypes.DEFAULT_TYPE):
+    st = context.application.bot_data.setdefault("manual_state", {"x": 680, "y": 380, "step": 75})
+    st.setdefault("x", 680)
+    st.setdefault("y", 380)
+    st.setdefault("step", 75)
+    return st
+
+
+async def _render_control(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None, note: str = ""):
+    browser = await get_browser(context)
+    st = _manual_state(context)
+    vp = await browser._viewport()
+    st["x"] = max(0, min(int(vp["w"]) - 1, int(st["x"])))
+    st["y"] = max(0, min(int(vp["h"]) - 1, int(st["y"])))
+    path = JOBS_DIR / f"control-{int(time.time()*1000)}.png"
+    await browser.screenshot_with_cursor(path, st["x"], st["y"])
+    mode = await browser.page_mode() if browser.page else "unknown"
+    caption = (
+        f"🖱 وضع التدريب اليدوي\n"
+        f"📍 X={st['x']}  Y={st['y']}   📏 خطوة={st['step']}px\n"
+        f"🧭 {mode}  🌐 {(browser.page.url if browser.page else '')[:220]}"
+    )
+    if note:
+        caption += f"\n{note[:500]}"
+    kb = _control_keyboard(int(st["step"]))
+    try:
+        if query:
+            with path.open("rb") as f:
+                try:
+                    await query.edit_message_media(media=InputMediaPhoto(media=f, caption=caption), reply_markup=kb)
+                    return
+                except Exception:
+                    pass
+        msg = update.effective_message if update else None
+        if msg:
+            with path.open("rb") as f:
+                await msg.reply_photo(f, caption=caption, reply_markup=kb)
+        elif query:
+            with path.open("rb") as f:
+                await query.message.reply_photo(f, caption=caption, reply_markup=kb)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@owner_only
+async def manual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["manual_mode"] = True
+    await update.effective_message.reply_text(
+        "🧪 فعلت وضع التدريب اليدوي. أي صورة ترسلها راح أخزنها فقط، وما راح أضغط Generate وحدي.\n"
+        "استخدم /control للتحكم بالماوس من البوت."
+    )
+    await _render_control(update, context)
+
+
+@owner_only
+async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    browser = await get_browser(context)
+    if browser.lock.locked():
+        await update.effective_message.reply_text("🟠 أكو عملية حالياً؛ ما أبدل الوضع وهي شغالة.")
+        return
+    context.application.bot_data["manual_mode"] = False
+    await update.effective_message.reply_text("🤖 فعلت الوضع التلقائي الحالي. للتدريب ارجع بـ /manual.")
+
+
+@owner_only
+async def control_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["manual_mode"] = True
+    await _render_control(update, context)
+
+
+@owner_only
+async def type_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args)
+    if not text:
+        await update.effective_message.reply_text("اكتب هكذا: /type النص الذي تريد كتابته")
+        return
+    browser = await get_browser(context)
+    st = _manual_state(context)
+    await browser.manual_type(st, text)
+    await update.effective_message.reply_text("⌨️ كتبت النص وسجلت الخطوة.")
+    await _render_control(update, context)
+
+
+@owner_only
+async def mark_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = " ".join(context.args).strip() or "step"
+    browser = await get_browser(context)
+    st = _manual_state(context)
+    path, elem = await browser.mark_training(st, name)
+    txt = json.dumps(elem, ensure_ascii=False, indent=2)[:2500]
+    with path.open("rb") as f:
+        await update.effective_message.reply_photo(f, caption=f"🏷 Mark: {name}\n{txt}")
+
+
+@owner_only
+async def exportlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not TRAIN_LOG.exists() or TRAIN_LOG.stat().st_size == 0:
+        await update.effective_message.reply_text("📭 بعد ماكو سجل تدريب. استخدم /control وابدأ تضغط.")
+        return
+    with TRAIN_LOG.open("rb") as f:
+        await update.effective_message.reply_document(f, filename="hunyuan-training-actions.jsonl", caption="🧠 سجل التدريب: الضغطات + الإحداثيات + العنصر تحت المؤشر + الصفحة.")
+
+
+@owner_only
+async def clearlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    TRAIN_LOG.unlink(missing_ok=True)
+    await update.effective_message.reply_text("🧹 مسحت سجل التدريب القديم.")
+
+
+@owner_only
+async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    uid = q.from_user.id if q.from_user else 0
+    if OWNER_ID and uid != OWNER_ID:
+        await q.answer("هذا التحكم خاص بصاحب البوت", show_alert=True)
+        return
+    await q.answer()
+    context.application.bot_data["manual_mode"] = True
+    browser = await get_browser(context)
+    st = _manual_state(context)
+    action = (q.data or "").split(":", 1)[-1]
+    step = int(st.get("step", 75))
+    move_map = {
+        "u": (0, -step), "d": (0, step), "l": (-step, 0), "r": (step, 0),
+        "ul": (-step, -step), "ur": (step, -step), "dl": (-step, step), "dr": (step, step),
+    }
+    note = ""
+    try:
+        if action in move_map:
+            await browser.manual_move(st, *move_map[action])
+        elif action == "step":
+            vals = [20, 50, 100, 180]
+            cur = int(st.get("step", 75))
+            nearest = min(range(len(vals)), key=lambda i: abs(vals[i] - cur))
+            st["step"] = vals[(nearest + 1) % len(vals)]
+            await browser.log_training_action("step_change", int(st["x"]), int(st["y"]), {"step": st["step"]})
+        elif action == "click":
+            el = await browser.manual_click(st, 1)
+            note = "✅ ضغطت وسجلت العنصر: " + ((el or {}).get("text") or (el or {}).get("selector") or "")[:160]
+        elif action == "dbl":
+            await browser.manual_click(st, 2)
+            note = "✅ Double click"
+        elif action == "su":
+            await browser.manual_scroll(st, -520)
+        elif action == "sd":
+            await browser.manual_scroll(st, 520)
+        elif action == "back":
+            await browser.manual_back(st)
+        elif action == "reload":
+            await browser.manual_reload(st)
+        elif action == "home":
+            await browser.manual_open_home(st)
+        elif action == "enter":
+            await browser.manual_key(st, "Enter")
+        elif action == "esc":
+            await browser.manual_key(st, "Escape")
+        elif action == "inspect":
+            el = await browser._element_at(int(st["x"]), int(st["y"]))
+            await browser.log_training_action("inspect", int(st["x"]), int(st["y"]), before=el)
+            txt = json.dumps(el, ensure_ascii=False, indent=2)[:3500]
+            await q.message.reply_text(f"👁 العنصر تحت المؤشر:\n{txt}")
+        elif action == "upload":
+            last = context.application.bot_data.get("last_manual_image")
+            if not last or not Path(last).exists():
+                note = "⚠️ أرسل صورة للبوت أولاً، بعدها اضغط رفع آخر صورة."
+            else:
+                await browser.manual_upload_file(st, Path(last))
+                note = "📎 رفعت آخر صورة وسجلت input المستخدم."
+        elif action == "refresh":
+            pass
+    except Exception as e:
+        log.exception("Manual control action failed")
+        note = f"❌ {e}"
+    await _render_control(update, context, query=q, note=note)
+
+
 async def _download_telegram_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Path]:
     msg = update.effective_message
     if msg.photo:
@@ -709,6 +1127,23 @@ async def _download_telegram_image(update: Update, context: ContextTypes.DEFAULT
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     browser = await get_browser(context)
+    if context.application.bot_data.get("manual_mode", MANUAL_DEFAULT):
+        image_path = await _download_telegram_image(update, context)
+        if not image_path:
+            await msg.reply_text("أرسل الصورة كصورة أو كملف صورة.")
+            return
+        old_path = context.application.bot_data.get("last_manual_image")
+        if old_path and Path(old_path).exists() and Path(old_path) != image_path:
+            try:
+                Path(old_path).unlink()
+            except Exception:
+                pass
+        context.application.bot_data["last_manual_image"] = str(image_path)
+        await msg.reply_text(
+            "🧪 خزنت الصورة للتدريب وما ضغطت أي شي بالموقع.\n"
+            "افتح /control وحرّك المؤشر، وبعدها اضغط 📎 رفع آخر صورة من شبكة الموس."
+        )
+        return
     if browser.lock.locked():
         await msg.reply_text(
             "🟠 عندي توليد شغّال حالياً. ما راح أضيف صورة ثانية حتى لا تتداخل الطلبات أو ينصرف رصيد إضافي.\n"
@@ -770,7 +1205,10 @@ async def post_init(application: Application):
     browser = HunyuanBrowser()
     await browser.start()
     application.bot_data["hunyuan_browser"] = browser
-    log.info("Browser started. noVNC: %s", novnc_url())
+    application.bot_data["manual_mode"] = MANUAL_DEFAULT
+    vp = await browser._viewport()
+    application.bot_data["manual_state"] = {"x": int(vp["w"]) // 2, "y": int(vp["h"]) // 2, "step": 75}
+    log.info("Browser started. noVNC: %s | manual_mode=%s", novnc_url(), MANUAL_DEFAULT)
 
 
 async def post_shutdown(application: Application):
@@ -791,10 +1229,18 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("manual", manual_cmd))
+    app.add_handler(CommandHandler("auto", auto_cmd))
+    app.add_handler(CommandHandler("control", control_cmd))
+    app.add_handler(CommandHandler("type", type_cmd))
+    app.add_handler(CommandHandler("mark", mark_cmd))
+    app.add_handler(CommandHandler("exportlog", exportlog_cmd))
+    app.add_handler(CommandHandler("clearlog", clearlog_cmd))
     app.add_handler(CommandHandler("login", login_cmd))
     app.add_handler(CommandHandler("open", open_cmd))
     app.add_handler(CommandHandler("shot", shot_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CallbackQueryHandler(control_callback, pattern=r"^ctl:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_handler))
     app.run_polling(drop_pending_updates=True)
 
