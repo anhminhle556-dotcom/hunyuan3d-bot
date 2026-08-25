@@ -12,6 +12,25 @@ STREAM_MARKER="$SESSION_DIR/.generation_stream"
 
 mkdir -p "$DATA_DIR" /tmp/downloads "$OS_DIR"
 
+# Railway volumes persist Chromium profile lock files across deploys.
+# A crashed/old container can leave Singleton* behind and make the next deploy crash
+# with "profile appears to be in use by another Chromium process".
+# Remove ONLY process lock/control files; cookies/login/session data stay untouched.
+PROFILE_DIR="$DATA_DIR/chrome-profile"
+mkdir -p "$PROFILE_DIR"
+rm -f \
+  "$PROFILE_DIR/SingletonLock" \
+  "$PROFILE_DIR/SingletonCookie" \
+  "$PROFILE_DIR/SingletonSocket" \
+  "$PROFILE_DIR/DevToolsActivePort" 2>/dev/null || true
+
+# If this script was restarted inside the same container, stop a local stale Chromium
+# that still points at this exact profile before Playwright launches a new one.
+pkill -TERM -f "user-data-dir=$PROFILE_DIR" 2>/dev/null || true
+sleep 1
+pkill -KILL -f "user-data-dir=$PROFILE_DIR" 2>/dev/null || true
+rm -f "$PROFILE_DIR/SingletonLock" "$PROFILE_DIR/SingletonCookie" "$PROFILE_DIR/SingletonSocket" "$PROFILE_DIR/DevToolsActivePort" 2>/dev/null || true
+
 x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vncpass >/dev/null
 Xvfb "$DISPLAY_NUM" -screen 0 1365x768x24 -ac +extension GLX +render -noreset &
 sleep 1

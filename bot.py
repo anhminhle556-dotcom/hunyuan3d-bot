@@ -54,6 +54,17 @@ for p in (PROFILE_DIR, JOBS_DIR, DOWNLOADS_DIR, TRAIN_DIR, SESSION_DIR, SHOTS_DI
     p.mkdir(parents=True, exist_ok=True)
 
 
+def cleanup_chromium_profile_locks():
+    """Remove only stale Chromium process locks; never delete login/session data."""
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"):
+        path = PROFILE_DIR / name
+        try:
+            if path.is_symlink() or path.exists():
+                path.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("Could not remove Chromium lock %s: %s", path, e)
+
+
 def owner_only(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else 0
@@ -214,20 +225,34 @@ class Browser:
 
     async def start(self):
         self.pw = await async_playwright().start()
-        self.context = await self.pw.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            viewport={"width": 1365, "height": 768},
-            accept_downloads=True,
-            downloads_path=str(DOWNLOADS_DIR),
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--start-maximized",
-                "--restore-last-session",
-            ],
-        )
+        cleanup_chromium_profile_locks()
+
+        async def launch_once():
+            return await self.pw.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=False,
+                viewport={"width": 1365, "height": 768},
+                accept_downloads=True,
+                downloads_path=str(DOWNLOADS_DIR),
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--start-maximized",
+                    "--restore-last-session",
+                ],
+            )
+
+        try:
+            self.context = await launch_once()
+        except Exception as e:
+            msg = str(e)
+            if "profile appears to be in use" not in msg and "ProcessSingleton" not in msg and "Singleton" not in msg:
+                raise
+            log.warning("Chromium profile lock detected; cleaning stale lock and retrying once")
+            cleanup_chromium_profile_locks()
+            await asyncio.sleep(1.0)
+            self.context = await launch_once()
         pages = self.context.pages
         restored = [p for p in pages if p.url not in ("", "about:blank")]
         self.page = restored[-1] if restored else (pages[0] if pages else await self.context.new_page())
